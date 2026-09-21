@@ -6,14 +6,21 @@ directory (the same directory KOReader creates for reading position and
 highlights), using a plain Lua table:
 
     return {
-      version = 1,
+      version = 2,
+      doc = { name = "book.pdf", kind = "pdf", pages = 320, bytes = 12345678 },
       pages = {
         [12] = {
-          { tool="pen", width=3, color="black", points={x1,y1,x2,y2,...} },
-          { tool="eraser", points={...} },
+          { tool="pen", space="page", width=3, color="black", points={x1,y1,x2,y2,...} },
+          { tool="eraser", space="page", points={...} },
         },
       },
     }
+
+`doc` is the document's fingerprint, written so an export tool can tell "these
+strokes belong to this file" from "these strokes belong to another file that
+happens to use the same kind of page numbers". The same data is dumped to
+`pencil_handwriting.json` on demand (see exportJSON), which is what export
+scripts and the pencil-ink web service read.
 --]]
 
 local logger = require("logger")
@@ -27,11 +34,32 @@ function StrokeStore:new(sidecar_dir)
     return setmetatable({
         sidecar_dir = sidecar_dir,
         pages = {},
+        -- Fingerprint of the document these strokes belong to (see
+        -- Config.DOC_FINGERPRINT). Filled in by main.lua once the document is
+        -- open, written on every save, and used by the export tools to refuse
+        -- to mix up two different books.
+        doc_meta = nil,
         -- Save outcome, surfaced in the diagnostics readout: a silent failure
         -- here is indistinguishable from "the plugin does not persist".
         last_save_error = nil,
         saved_count = nil,
+        last_export_error = nil,
     }, self)
+end
+
+function StrokeStore:setDocumentMeta(meta)
+    self.doc_meta = (type(meta) == "table") and meta or nil
+end
+
+-- One line for the diagnostics: what the file will claim about the document.
+function StrokeStore:describeDocMeta()
+    local m = self.doc_meta
+    if type(m) ~= "table" or (m.name == nil and m.pages == nil and m.bytes == nil) then
+        return "document fingerprint: none"
+    end
+    return string.format("document fingerprint: %s, %s, %s pages, %s bytes",
+        tostring(m.name or "-"), tostring(m.kind or "-"),
+        tostring(m.pages or "-"), tostring(m.bytes or "-"))
 end
 
 function StrokeStore:sidecarPath()
@@ -111,9 +139,13 @@ end
 -- Page coordinates are fractional (document pixels at scale 1). One decimal is
 -- far below what the screen can resolve and keeps the file from doubling in
 -- size, which matters because the file is written on every pen lift.
+--
+-- Non-finite values are folded to 0 rather than written out: "nan" in the middle
+-- of a JSON array is not JSON, and a NaN that reaches a renderer is worse than a
+-- misplaced point. The plugin already drops them at input; this is the belt.
 local function coord(value)
     local n = tonumber(value)
-    if not n then return "0" end
+    if not n or n ~= n or n == math.huge or n == -math.huge then return "0" end
     local rounded = math.floor(n * 10 + (n >= 0 and 0.5 or -0.5)) / 10
     if rounded == math.floor(rounded) then
         return string.format("%d", rounded)
@@ -127,6 +159,33 @@ local function pointList(points)
         out[i] = coord(points[i])
     end
     return table.concat(out, ",")
+end
+
+-- The document fingerprint, as it appears in the .lua file. Only fields that are
+-- actually known are written: a `bytes = nil` would break the reader side's
+-- comparison, so an unknown field is simply absent.
+local function docMetaLine(meta)
+    if type(meta) ~= "table" then return nil end
+
+    local fields = {}
+    local function add(key, value, quoted)
+        if value == nil or value == "" then return end
+        if quoted then
+            fields[#fields + 1] = string.format("%s=%q", key, tostring(value))
+        else
+            fields[#fields + 1] = string.format("%s=%s", key, tostring(value))
+        end
+    end
+
+    local name = meta.name
+    if type(name) == "string" and #name > 160 then name = name:sub(1, 160) end
+    add("name", name, true)
+    add("kind", meta.kind, true)
+    add("pages", tonumber(meta.pages))
+    add("bytes", tonumber(meta.bytes))
+
+    if #fields == 0 then return nil end
+    return "  doc = { " .. table.concat(fields, ", ") .. " },\n"
 end
 
 function StrokeStore:save()
@@ -151,6 +210,10 @@ function StrokeStore:save()
     f:write("-- pencil-handwriting.koplugin stroke data\n")
     f:write("return {\n")
     f:write("  version = ", Config.STROKE_FORMAT_VERSION, ",\n")
+    if Config.DOC_FINGERPRINT then
+        local meta_line = docMetaLine(self.doc_meta)
+        if meta_line then f:write(meta_line) end
+    end
     f:write("  pages = {\n")
 
     for page, strokes in pairs(self.pages) do
@@ -180,6 +243,117 @@ function StrokeStore:save()
         logger.dbg("PencilHW: saved", self.saved_count, "strokes to", path)
     end
     return true
+end
+
+-- ============================================================================
+-- JSON export
+-- ============================================================================
+-- Written by hand rather than through a JSON library: the file is a fixed,
+-- flat shape (numbers, short strings, arrays), there is no JSON module the
+-- plugin can count on, and an escaping bug here would silently produce a file
+-- that no tool can read.
+local function jsonEscape(value)
+    local text = tostring(value or "")
+    text = text:gsub("[\\\"]", "\\%0")
+    text = text:gsub("\n", "\\n"):gsub("\r", "\\r"):gsub("\t", "\\t")
+    -- Control characters cannot appear in a JSON string unescaped.
+    text = text:gsub("%c", function(c) return string.format("\\u%04x", c:byte()) end)
+    return text
+end
+
+local function jsonNumber(value, fallback)
+    local n = tonumber(value)
+    if not n or n ~= n then return tostring(fallback or 0) end
+    if n == math.floor(n) and math.abs(n) < 1e15 then
+        return string.format("%d", n)
+    end
+    return string.format("%.4f", n)
+end
+
+function StrokeStore:jsonPath()
+    if not self.sidecar_dir then return nil end
+    return self.sidecar_dir .. "/" .. Config.JSON_EXPORT_FILENAME
+end
+
+-- Exports every stroke, in every coordinate space, exactly as stored -- the
+-- consumer (a script, the pencil-ink web service) decides what it can use. The
+-- page key is always a string so that reflow documents' xpointers survive.
+function StrokeStore:exportJSON()
+    local path = self:jsonPath()
+    if not path then
+        self.last_export_error = "no sidecar directory"
+        return nil, self.last_export_error
+    end
+
+    util.makePath(self.sidecar_dir)
+    local f = io.open(path, "w")
+    if not f then
+        self.last_export_error = "cannot write " .. path
+        return nil, self.last_export_error
+    end
+
+    local out = {}
+    local function w(s) out[#out + 1] = s end
+
+    w("{\n")
+    w('  "format": "pencil-handwriting",\n')
+    w('  "version": ' .. jsonNumber(Config.STROKE_FORMAT_VERSION) .. ",\n")
+    w('  "plugin": "' .. jsonEscape(Config.VERSION) .. '",\n')
+
+    if Config.DOC_FINGERPRINT and type(self.doc_meta) == "table" then
+        local meta = self.doc_meta
+        local fields = {}
+        if type(meta.name) == "string" and meta.name ~= "" then
+            fields[#fields + 1] = '    "name": "' .. jsonEscape(meta.name) .. '"'
+        end
+        if type(meta.kind) == "string" and meta.kind ~= "" then
+            fields[#fields + 1] = '    "kind": "' .. jsonEscape(meta.kind) .. '"'
+        end
+        if tonumber(meta.pages) then
+            fields[#fields + 1] = '    "pages": ' .. jsonNumber(meta.pages)
+        end
+        if tonumber(meta.bytes) then
+            fields[#fields + 1] = '    "bytes": ' .. jsonNumber(meta.bytes)
+        end
+        if #fields > 0 then
+            w('  "doc": {\n' .. table.concat(fields, ",\n") .. "\n  },\n")
+        end
+    end
+
+    w('  "pages": {')
+    local first_page = true
+    for page, strokes in pairs(self.pages) do
+        w(first_page and "\n" or ",\n")
+        first_page = false
+        w('    "' .. jsonEscape(page) .. '": [')
+        for i = 1, #strokes do
+            local s = strokes[i]
+            w(i == 1 and "\n" or ",\n")
+            w('      { "tool": "' .. jsonEscape(s.tool or "pen")
+                .. '", "space": "' .. jsonEscape(s.space or "native")
+                .. '", "width": ' .. jsonNumber(s.width, Config.DEFAULT_WIDTH)
+                .. ', "color": "' .. jsonEscape(s.color or Config.DEFAULT_COLOR)
+                .. '", "points": [')
+            local pts = {}
+            for j = 1, #(s.points or {}) do
+                pts[j] = coord(s.points[j])
+            end
+            w(table.concat(pts, ","))
+            w("] }")
+        end
+        w("\n    ]")
+    end
+    if not first_page then w("\n") end
+    w("  }\n}\n")
+
+    f:write(table.concat(out))
+    f:close()
+
+    self.last_export_error = nil
+    self.exported_path = path
+    self.exported_count = self:strokeCount()
+    logger.info("PencilHW: exported", self.exported_count, "strokes to", path)
+    return path
 end
 
 -- How many strokes are in each coordinate space. A file that mixes them is
@@ -215,10 +389,11 @@ function StrokeStore:describe()
         size = tostring(#(content or "")) .. " bytes"
     end
     local spaces = self:spaceCounts()
-    return string.format("sidecar: %s\nfile: %s, saved strokes: %s, last error: %s%s",
+    return string.format("sidecar: %s\nfile: %s, saved strokes: %s, last error: %s%s\n%s",
         path, size, tostring(self.saved_count or "-"),
         tostring(self.last_save_error or "none"),
-        spaces ~= "" and ("\nstroke space: " .. spaces) or "")
+        spaces ~= "" and ("\nstroke space: " .. spaces) or "",
+        self:describeDocMeta())
 end
 
 -- Note: writing the sidecar on every single stroke would rewrite the whole

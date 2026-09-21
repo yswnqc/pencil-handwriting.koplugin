@@ -502,6 +502,8 @@ end
 
 -- Emitted once per SYN_REPORT while a tool is in contact.
 function EvdevReader:flushFrame()
+    self.frames_seen = (self.frames_seen or 0) + 1
+
     if self.pen_down and self.onPenMove then
         local sx, sy = self:transform(self.x, self.y)
         self.onPenMove(sx, sy, self.pressure)
@@ -509,6 +511,35 @@ function EvdevReader:flushFrame()
         local sx, sy = self:transform(self.x, self.y)
         self.onEraserMove(sx, sy)
     end
+end
+
+-- ---------------------------------------------------------------------------
+-- Pen pose -- the origin oracle's ground truth
+-- ---------------------------------------------------------------------------
+-- Everything here comes from *this node's own events*, which is what makes it
+-- usable as an answer instead of an estimate: the capacitive layer never writes
+-- to this node, so the pose is the pen and nothing else.
+--
+-- `frames` counts SYN_REPORTs since the node was opened. A descriptor that has
+-- delivered none cannot be told apart from a pen that is never used, so a caller
+-- must wait for this to grow before trusting a "not the pen" answer -- an empty
+-- listener would otherwise condemn every sample to being a hand.
+function EvdevReader:pose()
+    -- transform() is a no-op when the node reported no usable axis range, which
+    -- is the case on this device, so the raw value is the panel value.
+    local x, y = self:transform(self.x, self.y)
+    return {
+        tool = self.tool,
+        contact = (self.pen_down or self.eraser_down) and true or false,
+        x = x,
+        y = y,
+        frames = self.frames_seen or 0,
+        events = self.event_count or 0,
+    }
+end
+
+function EvdevReader:isProven()
+    return (self.frames_seen or 0) >= Config.PEN_ORACLE_MIN_FRAMES
 end
 
 return EvdevReader

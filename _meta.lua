@@ -17,6 +17,6 @@ local ok, Config = pcall(require, "pencilhw/config")
 
 return {
     fullname = _("Pencil handwriting"),
-    version = (ok and Config and Config.VERSION) or "0.9.9",
+    version = (ok and Config and Config.VERSION) or "0.13.1",
     description = _("Low-latency stylus handwriting for e-ink readers with a Wacom/EMR digitizer (Kindle Scribe). Uses KOReader's stylus pipeline when available and can fall back to reading the digitizer node directly."),
 }

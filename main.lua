@@ -35,6 +35,27 @@ Design notes
 * Erasing cannot paint white, for the same reason: it deletes the strokes the
   eraser touched and asks for a repaint.
 
+* Only the pen writes. A skin contact cannot be told from the pen by the event
+  data -- KOReader's touch layer writes its contacts into whichever slot is
+  current, and that is the pen slot once the pen has been seen -- so the gate is
+  the *path* the samples describe: the digitizer tracks the pen and nothing else,
+  and a contact on the far side of the page is a jump no pen tip can make between
+  two samples. Such a sample is dropped rather than drawn, so a hand landing on
+  the page produces no ink at all instead of a line across it (see "Pen-only
+  gate" below for the three cases and the one deliberate exception).
+
+* Touch blocking is layered, because a touch zone can match only one gesture
+  name (GestureRange compares `ges` with ==):
+
+  - the zones cover what a *resting* hand makes before the pen lands -- tap,
+    long press, double tap -- plus zones that only count what still gets
+    through, for the diagnostics;
+  - everything a hand makes *while* the pen is down (swipe, pan, pinch,
+    multiswipe, whatever it is called) is covered instead by switching the
+    reader's touch input off for as long as the pen is in contact
+    (InputContainer:setIgnoreTouchInput). One call for every gesture type, and
+    it is released again as soon as the pen leaves, so fingers keep working.
+
 * All submodules live under the plugin-private `pencilhw/` namespace. Sharing
   KOReader's global package.loaded table with other plugins makes a generic
   name such as `core/store` unsafe: whichever plugin loads first wins, and
@@ -117,6 +138,18 @@ local TextViewer    = require("ui/widget/textviewer")
 local UIManager     = require("ui/uimanager")
 local T             = require("ffi/util").template
 
+-- A clock for the pen's position check. ui/time is core KOReader, but a plugin
+-- must not die over it: without it the limit simply stops adapting to the time
+-- between samples (see penPointAllowed), which only makes the check stricter.
+local Time
+do
+    local ok, mod = pcall(require, "ui/time")
+    if ok and type(mod) == "table" and type(mod.now) == "function"
+        and type(mod.since) == "function" and type(mod.to_ms) == "function" then
+        Time = mod
+    end
+end
+
 -- ---------------------------------------------------------------------------
 -- Small helpers (all lazy: nothing may touch the screen at load time)
 -- ---------------------------------------------------------------------------
@@ -131,15 +164,16 @@ local function getInput()
     return device and device.input or nil
 end
 
-local TOOL_PEN, TOOL_ERASER, TOOL_HIGHLIGHTER
+local TOOL_PEN, TOOL_ERASER, TOOL_HIGHLIGHTER, TOOL_FINGER
 local function toolTypes()
     if not TOOL_PEN then
         local input = getInput()
         TOOL_PEN         = (input and input.TOOL_TYPE_PEN) or 1
         TOOL_ERASER      = (input and input.TOOL_TYPE_ERASER) or 2
         TOOL_HIGHLIGHTER = (input and input.TOOL_TYPE_HIGHLIGHTER) or 3
+        TOOL_FINGER      = (input and input.TOOL_TYPE_FINGER) or 0
     end
-    return TOOL_PEN, TOOL_ERASER, TOOL_HIGHLIGHTER
+    return TOOL_PEN, TOOL_ERASER, TOOL_HIGHLIGHTER, TOOL_FINGER
 end
 
 -- The framebuffer's own size is authoritative: everything we draw targets it.
@@ -201,6 +235,21 @@ local PencilHandwriting = InputContainer:extend{
     input_mode = Config.INPUT_SOURCE,
     full_refresh = Config.FULL_REFRESH_ON_PAGE_CHANGE,
 
+    -- Touch blocking (see the section further down). "touch_blocked" is our
+    -- mirror of the reader-wide ignore-touch state: it says whether *we* are the
+    -- reason touch is off, so it can always be handed back. The generation
+    -- invalidates the timers of a previous stroke, and the sequence number tells
+    -- the watchdog a writing pen from a pen that is gone.
+    touch_blocked = false,
+    pen_contact = false,
+    pen_event_seq = 0,
+    touch_block_generation = 0,
+    touch_release_pending = false,
+    -- True when touch was already switched off before the pen touched the
+    -- screen (somebody else's doing), in which case it is not ours to switch
+    -- back on when the stroke ends.
+    touch_block_foreign = false,
+
     reader = nil,
     store = nil,
 
@@ -234,6 +283,30 @@ local PencilHandwriting = InputContainer:extend{
     last_pen_y = nil,
     last_page_x = nil,
     last_page_y = nil,
+    -- Pen-only gate (see that section): where the pen was last seen and when.
+    -- Kept across strokes on purpose -- the reference has to survive a lift, or a
+    -- stroke that starts right after one would look like it comes from nowhere.
+    pen_anchor_x = nil,
+    pen_anchor_y = nil,
+    pen_anchor_at = nil,
+    -- Whether the digitizer has ever reported the pen hovering: without hover
+    -- reports the anchor goes stale between strokes, and then gating the start of
+    -- a stroke on the distance would reject real writing.
+    hover_seen = false,
+
+    -- Which contact each slot's frames are being answered for -- "pen" or
+    -- "skin" -- keyed by slot number and cleared when that slot lifts. KOReader
+    -- keys its gesture contacts the same way and only ends them on a lift, so
+    -- the answer has to hold for the whole contact instead of being decided
+    -- again on every frame (see slotLatchOf).
+    slot_latch = nil,
+    -- When the pen was last seen at all, hover included. Only the tap-shaped
+    -- blocking zones use this window: a palm that stays where it landed after a
+    -- stroke is a hold, and a hold opens a dialog (see touchBlockWanted).
+    pen_seen_time = nil,
+    -- Session override of Config.PEN_ORACLE, so the listener can be switched off
+    -- from the menu and the difference seen for what it is.
+    pen_oracle_off = false,
     -- Per-stroke view mapping (see pencilhw/viewmap.lua): measured when the pen
     -- goes down and reused for the whole stroke, so the stroke cannot be
     -- measured against two different views.
@@ -285,6 +358,49 @@ function PencilHandwriting:init()
         pos_updates = 0,
         strokes_committed = 0,
         strokes_dropped = 0,
+        touch_block_enters = 0,
+        touch_block_releases = 0,
+        touch_block_watchdog = 0,
+        touch_block_errors = 0,
+        -- Pen-only gate: skin events turned away, samples too far away to be the
+        -- pen, and the hover reports that make the check trustworthy.
+        skin_events = 0,
+        -- Frames handed back untouched because the slot's contact is already
+        -- known to be a hand (see slotLatchOf). This is the count of samples a
+        -- finger got back rather than being swallowed by the pen's slot.
+        passthrough_frames = 0,
+        other_tool_events = 0,
+        pen_points_rejected = 0,
+        hover_events = 0,
+        anchor_resyncs = 0,
+        last_pen_reject = "-",
+        -- Gestures that still reached the reader while the pen was on the
+        -- glass. With the global block in place this must stay empty; anything
+        -- in it means the block is not being applied on this device.
+        leaked_gestures = {},
+        -- Origin oracle (see Config.PEN_ORACLE and classifyStylusOrigin): what
+        -- the digitizer node said about each sample, and what it was allowed to
+        -- do with that answer.
+        --
+        -- The three "earned" counters are what make a broken listener harmless:
+        -- `oracle_pen_tool` is a node that has reported the pen tool, `oracle_down`
+        -- one that has reported the tip down, `oracle_pen` one that has agreed
+        -- with the pen about a position. Each one unlocks one of the refusals.
+        -- `oracle_min_dist` is the number to look at when the pen "does not
+        -- write": it says whether the two readers share a coordinate space.
+        oracle_pen_tool = 0,
+        oracle_down = 0,
+        oracle_pen = 0,
+        oracle_hovers = 0,
+        oracle_skin = 0,
+        oracle_unknown = 0,
+        oracle_judged = 0,
+        oracle_contacts = 0,
+        oracle_frames = 0,
+        oracle_errors = 0,
+        oracle_min_dist = -1,
+        oracle_last_dist = -1,
+        last_oracle = "-",
         last_slot = "-",
         last_error = "-",
     }
@@ -332,6 +448,10 @@ function PencilHandwriting:initReader()
 
     self.store = StrokeStore:new(self:getSidecarDir())
     self.store:load()
+    -- The document is not fully set up yet at this point on some builds, so this
+    -- is repeated in onReaderReady(); whatever is known now goes into the file
+    -- if a stroke is saved before that.
+    self:refreshDocumentMeta()
     self:refreshPageKey()
 
     self.ui.menu:registerToMainMenu(self)
@@ -352,6 +472,9 @@ function PencilHandwriting:onReaderReady()
     self:installPaintHook()
 
     self:refreshPageKey()
+    -- Now that the document is open, the page count and the file size are real:
+    -- this is the fingerprint the stroke file (and the JSON export) will carry.
+    self:refreshDocumentMeta()
     -- Strokes are drawn by the paintTo hook, so a repaint is all it takes.
     self:requestRepaint("ui")
 
@@ -374,6 +497,10 @@ function PencilHandwriting:initReaderInput()
 end
 
 function PencilHandwriting:onCloseDocument()
+    -- Touch is handed back first: the document is about to go away, so there is
+    -- no stroke left to protect and nothing to wait for.
+    self:releaseTouchBlock("closing document", true)
+
     self:stopCapture()
     self:removeStylusCallback()
     self:removePaintHook()
@@ -384,8 +511,11 @@ function PencilHandwriting:onCloseDocument()
 end
 
 -- Knock on wood: flush on suspend too, so a device that goes to sleep (or out
--- of battery) cannot take the last strokes with it.
+-- of battery) cannot take the last strokes with it. Touch is handed back for the
+-- same reason it is on close: nothing is being written while the reader sleeps,
+-- and a state left behind would only be inherited by the next session.
 function PencilHandwriting:onSuspend()
+    self:releaseTouchBlock("suspend", true)
     if self.store then self.store:save() end
 end
 
@@ -866,6 +996,58 @@ function PencilHandwriting:onStylusSlot(input, slot)
     return self.enabled == true
 end
 
+-- Which contact a slot's frames belong to. KOReader merges the digitizer and
+-- the capacitive layer into one set of slots, and it keys its gesture contacts
+-- by slot number -- ending each one only when that slot lifts. So what this
+-- plugin decides about the first frame of a contact has to hold until the
+-- contact ends; it cannot be decided again on every frame:
+--
+--   * a contact handed back to the gesture detector must have its lift handed
+--     back too. Otherwise the finger's swipe is never completed and the detector
+--     is left holding a contact that never ends -- and every later frame in that
+--     slot is read as a continuation of it. From the outside that is a reader
+--     that has stopped responding to touch;
+--   * a contact this plugin dominated must be dominated to the end, or the tail
+--     of the pen's own stroke reaches the detector as a gesture: a swipe, a
+--     corner tap, a hold -- any of which turns a page or opens something.
+--
+-- Nothing is remembered past a lift, so a slot is free to be a hand and then the
+-- pen, or the other way round.
+function PencilHandwriting:slotLatchOf(slot_no)
+    local latches = self.slot_latch
+    if not latches or slot_no == nil then return nil end
+    return latches[slot_no]
+end
+
+function PencilHandwriting:setSlotLatch(slot_no, verdict)
+    if slot_no == nil then return end
+    if not self.slot_latch then self.slot_latch = {} end
+    self.slot_latch[slot_no] = verdict
+end
+
+function PencilHandwriting:clearSlotLatches()
+    self.slot_latch = nil
+end
+
+-- Abandons the gesture detector's contact for a slot. This exists for the one
+-- transition that feeding it more frames cannot express: a contact that was a
+-- hand and has become the pen. Dropping it also cancels whatever timer was
+-- behind it (a hold, a double tap), so a palm that was about to become a hold
+-- cannot open a dialog in the middle of a stroke.
+--
+-- Entirely optional: if the object is not shaped as expected, the transition
+-- simply goes unhandled instead of raising anything.
+function PencilHandwriting:abandonGestureContact(slot_no)
+    if slot_no == nil then return end
+    local input = getInput()
+    local detector = input and input.gesture_detector
+    if not (detector and detector.getContact and detector.dropContact) then return end
+
+    local ok, contact = pcall(detector.getContact, detector, slot_no)
+    if not ok or not contact then return end
+    pcall(detector.dropContact, detector, contact)
+end
+
 function PencilHandwriting:handleStylusSlot(input, slot)
     if not self.stats then return false end
 
@@ -895,16 +1077,56 @@ function PencilHandwriting:handleStylusSlot(input, slot)
         return true
     end
 
-    -- A dialog is on screen: swallow the event but draw nothing into it.
-    if self:isOverlayActive() then return true end
-
-    local pen_tool, eraser_tool, highlighter_tool = toolTypes()
+    local pen_tool, eraser_tool, highlighter_tool, finger_tool = toolTypes()
     local tool = slot.tool
+    local is_pen = tool == pen_tool or tool == eraser_tool or tool == highlighter_tool
     local in_contact = slot.id ~= nil and slot.id >= 0
 
-    if not in_contact then
-        -- Lift or hover. Hover is bracketed by BTN_TOOL_PEN and carries
-        -- id = -1, so it must never start or extend a stroke.
+    local slot_no = slot.slot
+    local latch = self:slotLatchOf(slot_no)
+    if not in_contact then self:setSlotLatch(slot_no, nil) end
+
+    if latch == "skin" then
+        -- A contact already answered for as a hand: whatever is decided about
+        -- this frame, its frames go back untouched so the gesture the finger
+        -- started can finish. Tested before the overlay check on purpose -- a
+        -- dialog's own touches must not be swallowed by a hand's contact either.
+        --
+        -- ...unless the digitizer names the pen on a contact frame, which is
+        -- what re-opens the question below: a hand resting under the writing
+        -- hand must not be able to stop the pen from writing.
+        local certified = self:isCertifiedPen(x, y, in_contact)
+        if not certified then
+            self.stats.skin_events = self.stats.skin_events + 1
+            self.stats.passthrough_frames = (self.stats.passthrough_frames or 0) + 1
+            if not in_contact then
+                -- A lift the plugin did not recognise as the pen: the tip is off
+                -- the glass either way, so the contact window ends here (which
+                -- is also what keeps a misjudged lift from leaving touch
+                -- switched off -- the watchdog would take 15 s to notice).
+                if self.current_stroke then
+                    if self.current_stroke.tool == "eraser" then
+                        self:onEraserUp()
+                    else
+                        self:onPenUp()
+                    end
+                end
+                self:notePenLift()
+            end
+            return false
+        end
+        -- The pen: abandon whatever the finger started and take the slot over.
+        self:abandonGestureContact(slot_no)
+        self:setSlotLatch(slot_no, "pen")
+        latch = "pen"
+    end
+
+    -- A dialog is on screen: swallow the event but draw nothing into it.
+    if self:isOverlayActive() then
+        -- Hand touch straight back so the dialog stays operable, and close any
+        -- stroke that was open when it appeared. The stroke is committed rather
+        -- than dropped: left open, the next pen move would extend it from its
+        -- old position and draw a line right across the page.
         if self.current_stroke then
             if self.current_stroke.tool == "eraser" then
                 self:onEraserUp()
@@ -912,8 +1134,146 @@ function PencilHandwriting:handleStylusSlot(input, slot)
                 self:onPenUp()
             end
         end
-        -- Dominate pen slots while drawing so the pen can never drive a
-        -- gesture. Fingers use a different slot and stay fully functional.
+        self:releaseTouchBlock("dialog open", true)
+        return true
+    end
+
+    -- Ask the digitizer's own node who sent this, before believing anything the
+    -- slot says about itself: the tool in there is the pen's own sticky value
+    -- even when the contact came from the capacitive layer. (A certified pen
+    -- contact has already been established above and is not asked twice.)
+    local origin = latch == "pen" and "pen" or self:classifyStylusOrigin(x, y, in_contact)
+    local certified = (origin == "pen")
+    local refused = (origin == "skin")
+
+    if origin == nil then
+        -- Nothing to ask: no oracle yet, it was given up on, or it could not
+        -- earn the claim it would have had to make. Fall back to what the slot
+        -- says about itself, and count it so the diagnostics shows how often the
+        -- answer was missing rather than merely "pen".
+        self.stats.oracle_unknown = (self.stats.oracle_unknown or 0) + 1
+    end
+
+    -- Two separate answers, because they answer to different things. Ink is
+    -- per-sample (the pen is either here or it is not); domination is
+    -- per-contact (the detector cannot be handed half of one).
+    local allow = certified
+    if not certified then
+        if refused or latch == "skin" then
+            -- Named as a hand, or a contact already answered for as one and the
+            -- oracle cannot re-open the question: no ink.
+            allow = false
+        else
+            allow = is_pen   -- the slot's own claim, as it was before the oracle
+        end
+    end
+
+    local dominate
+    if not in_contact then
+        -- A lift or hover on its own is not a gesture: the detector drops a
+        -- contact it never saw go down ("hover pen events are also good
+        -- candidates for this"), so handing it back costs nothing -- and
+        -- dominating it is what used to eat the lift of a gesture that had
+        -- already been handed back.
+        dominate = false
+    elseif latch == "pen" then
+        dominate = true
+    elseif certified then
+        -- The pen: the slot is this plugin's from here to the lift, so the
+        -- detector never sees half a stroke. A contact it was holding as a hand
+        -- is abandoned -- which also cancels any pending hold behind it.
+        self:abandonGestureContact(slot_no)
+        self:setSlotLatch(slot_no, "pen")
+        dominate = true
+    elseif allow then
+        -- Not certified, but the gate accepts it as the pen's.
+        self:abandonGestureContact(slot_no)
+        self:setSlotLatch(slot_no, "pen")
+        dominate = true
+    elseif refused or tool == finger_tool then
+        -- A hand: hand every frame of this contact back, lift included.
+        self:setSlotLatch(slot_no, "skin")
+        dominate = false
+    else
+        -- Unknown, and an unknown contact may well be the pen: dominate it
+        -- rather than let it drive a gesture.
+        self:setSlotLatch(slot_no, "pen")
+        dominate = true
+    end
+
+    if not allow then
+        -- No ink. Counted separately from the oracle's own verdicts: this is
+        -- what the handler did with them.
+        if refused or latch == "skin" or tool == finger_tool then
+            self.stats.skin_events = self.stats.skin_events + 1
+        else
+            self.stats.other_tool_events = (self.stats.other_tool_events or 0) + 1
+        end
+        if not dominate then
+            -- Handed back to KOReader: this is the count of samples a finger got
+            -- back instead of being swallowed by the pen's slot.
+            self.stats.passthrough_frames = (self.stats.passthrough_frames or 0) + 1
+        end
+        if not in_contact then
+            -- A lift the plugin did not recognise: the tip is off the glass
+            -- either way, so the contact window ends and an open stroke is
+            -- committed rather than left to be extended by the next sample.
+            if self.current_stroke then
+                if self.current_stroke.tool == "eraser" then
+                    self:onEraserUp()
+                else
+                    self:onPenUp()
+                end
+            end
+            self:notePenLift()
+        end
+        return dominate
+    end
+
+    if not in_contact then
+        -- Lift or hover. Hover is bracketed by BTN_TOOL_PEN and carries
+        -- id = -1, so it must never start or extend a stroke -- but it is also
+        -- what keeps the pen-only gate's reference point up to date while the pen
+        -- travels between strokes, which is why it is fed to the gate first.
+        self.stats.hover_events = self.stats.hover_events + 1
+        self.hover_seen = true
+        self:notePenSeen()
+        if certified and (self.stats.oracle_pen or 0) > 0 then
+            -- The digitizer vouched for this sample *and* has been shown to
+            -- agree with the pen about where the pen is, so the position is the
+            -- pen's: the fallback anchor can follow it without any doubt.
+            self:movePenAnchor(x, y)
+        else
+            self:penPointAllowed(x, y, "hover")   -- moves the anchor when it is the pen
+        end
+
+        if self.current_stroke then
+            if self.current_stroke.tool == "eraser" then
+                self:onEraserUp()
+            else
+                self:onPenUp()
+            end
+        end
+        -- The tip is off the glass, so the contact window is over. Done here as
+        -- well as in onPenUp, because a pen that hovers without ever having
+        -- drawn has no stroke to close and would otherwise hold the window open.
+        self:notePenLift()
+        -- Strict level only: the pen being around at all is enough to want touch
+        -- off, which is exactly the trade the switch is for.
+        self:engageTouchBlock("pen hover", true)
+        return dominate
+    end
+
+    -- In contact, and this contact is this plugin's to answer for -- see the
+    -- latch above. Unless the digitizer vouched for this sample, it has to pass
+    -- the pen-only gate before it can move any ink, whether it starts a stroke
+    -- or extends one.
+    self:notePenSeen()
+    if certified then
+        self:movePenAnchor(x, y)
+    elseif self.current_stroke then
+        if not self:penPointAllowed(x, y, "move") then return true end
+    elseif not self:penPointAllowed(x, y, "down") then
         return true
     end
 
@@ -937,6 +1297,15 @@ function PencilHandwriting:handleStylusSlot(input, slot)
     end
 
     return true
+end
+
+-- Asked before the main classification for the one case that has to override an
+-- earlier answer: a contact already latched as a hand. Cheap on purpose -- it is
+-- the oracle's own verdict, without the health check or the bookkeeping.
+function PencilHandwriting:isCertifiedPen(x, y, in_contact)
+    if not (in_contact and Config.PEN_ORACLE and not self.pen_oracle_off) then return false end
+    if (self.stats.oracle_pen or 0) == 0 then return false end   -- nothing earned yet
+    return self:classifyStylusOrigin(x, y, in_contact) == "pen"
 end
 
 -- Coordinates arrive in the digitizer's raw frame, which is normally the
@@ -1014,6 +1383,14 @@ function PencilHandwriting:startCapture()
 
     local mode = self.input_mode or Config.INPUT_SOURCE
 
+    -- The origin oracle runs alongside either input source: even when the pen
+    -- arrives through KOReader's stylus API, the digitizer's own node is what
+    -- tells a pen sample from a hand. A fresh session gets a fresh try at it.
+    self.pen_oracle_dead = false
+    if not self:openPenOracle() then
+        logger.info("PencilHW: no pen oracle; the distance gate decides alone")
+    end
+
     if mode ~= "evdev" and self.stylus_callback then
         self.input_source = "stylus"
         logger.info("PencilHW: capturing via KOReader stylus API")
@@ -1081,10 +1458,18 @@ function PencilHandwriting:stopCapture()
     self:cancelGhostRefresh()
     self:cancelEraseRefresh()
     self.erase_last_x, self.erase_last_y, self.erase_last_time = nil, nil, nil
+    -- No contact is this plugin's to answer for any more, and the pen is not
+    -- "around" either -- otherwise the hold/double-tap windows would keep the
+    -- zones armed for a couple of seconds after drawing was switched off.
+    self:clearSlotLatches()
+    self.pen_seen_time = nil
 
     if self.reader then
         self.reader:close()
     end
+    -- The oracle's descriptor too: it is only worth listening while there is ink
+    -- to protect, and it would otherwise be leaked once per document.
+    self:closePenOracle()
     self.range_only = false
     self.input_source = nil
 end
@@ -1141,11 +1526,342 @@ function PencilHandwriting:screenMapper()
     return function(x, y) return self:toScreen(x, y) end
 end
 
+-- ============================================================================
+-- Pen-only gate
+-- ============================================================================
+-- Skin must never write, and the event data cannot tell the pen from a hand by
+-- itself: KOReader's touch layer writes its contacts into whichever slot is
+-- *current*, and that is the pen slot as soon as the pen has been seen, with the
+-- pen's own tool and contact id still sitting in it. A finger therefore arrives
+-- here looking exactly like the pen -- same slot, same (stale) tool, same
+-- (sticky) id. The diagnostics print all of it on the "Last slot" line, which is
+-- how this was established.
+--
+-- The path is what a hand cannot fake. The digitizer tracks the pen and nothing
+-- else, so its samples form a continuous line; a contact on the far side of the
+-- page is a jump no pen tip can make between two samples. Those samples are
+-- measured, counted and dropped instead of being drawn -- which is what turns a
+-- hand landing on the page mid-stroke into no ink at all, instead of a straight
+-- line right across it.
+--
+-- The reference point ("anchor") is updated by every sample that is accepted, and
+-- by hover reports, so it follows the pen while it travels between strokes. It is
+-- deliberately not cleared when a stroke ends: the pen is still wherever it was.
+
+-- Milliseconds since the anchor was last moved, or nil when there is no clock.
+function PencilHandwriting:penAnchorAgeMs()
+    if not (Time and self.pen_anchor_at) then return nil end
+
+    local ok, ms = pcall(function()
+        return Time.to_ms(Time.since(self.pen_anchor_at))
+    end)
+    if ok and type(ms) == "number" then return ms end
+    return nil
+end
+
+function PencilHandwriting:movePenAnchor(x, y)
+    self.pen_anchor_x, self.pen_anchor_y = x, y
+    if not Time then return end
+
+    local ok = pcall(function() self.pen_anchor_at = Time.now() end)
+    if not ok then Time = nil end
+end
+
+-- ============================================================================
+-- Pen origin oracle
+-- ============================================================================
+-- The stylus callback cannot say whether a sample is the pen. KOReader hands
+-- over the digitizer *slot*, and the capacitive layer writes its own contacts
+-- into that same slot leaving the pen's tool and contact id in it (see the note
+-- in Config), so a finger arrives looking exactly like the pen. Guessing from
+-- the shape of the path -- what the gate below does -- is beaten by a hand that
+-- lands close enough to the nib.
+--
+-- The digitizer's own node has no such problem: it reports the pen and nothing
+-- else. So we listen to it -- read-only and without grabbing, which is safe
+-- because KOReader's own input layer never grabs an input node (checked in
+-- frontend/device/input.lua and frontend/device/kindle/device.lua) and evdev
+-- delivers every event to every open descriptor, so the reader keeps working
+-- exactly as before.
+--
+-- That answers the one question the callback cannot answer about itself: is the
+-- tip on the glass right now, and is it here? The listener is drained from
+-- inside the callback rather than from a timer, because the frame being
+-- processed is already in our queue (the kernel queues at emission time), so
+-- reading it there is never stale and never races KOReader's own read.
+function PencilHandwriting:openPenOracle()
+    if not Config.PEN_ORACLE then return false end
+    -- Switched off from the menu for this session. Checked here as well as in
+    -- classifyStylusOrigin, because this is what startCapture calls on every
+    -- document open: without it the descriptor comes back the next time a book
+    -- is opened, and the diagnostics would say "listening" under an unchecked
+    -- menu item.
+    if self.pen_oracle_off then return false end
+    -- The evdev input source owns the pen node and may have grabbed it, in which
+    -- case a second listener would hear nothing anyway.
+    if self.input_mode == "evdev" then return false end
+    if self.pen_oracle then return true end
+
+    local reader = EvdevReader:new()
+    -- No callbacks on purpose: this instance exists to be asked, not to draw.
+    -- `false` means no EVIOCGRAB -- grabbing here would take the pen away from
+    -- KOReader and leave this plugin's own drawing with nothing to read.
+    if not reader:open(false) then return false end
+
+    self.pen_oracle = reader
+    logger.info("PencilHW: pen oracle listening on", tostring(reader.device_path))
+    return true
+end
+
+function PencilHandwriting:closePenOracle()
+    local reader = self.pen_oracle
+    self.pen_oracle = nil
+    if not reader then return end
+    pcall(function() reader:close() end)
+end
+
+-- Drain the digitizer node and report its pose, or nil when there is nothing to
+-- ask: no node, the switch is off, or the listener was given up on.
+function PencilHandwriting:penOraclePose()
+    if not Config.PEN_ORACLE or self.pen_oracle_dead then return nil end
+
+    local reader = self.pen_oracle
+    if not reader or not reader:isOpen() then return nil end
+
+    local ok, pose = pcall(function()
+        reader:poll()
+        -- Until it has proved it receives, it cannot be told apart from a pen
+        -- that is never used, and trusting it would condemn every sample.
+        if not reader:isProven() then return nil end
+        return reader:pose()
+    end)
+    if not ok then
+        -- A listener that throws is worse than no listener at all: the gate
+        -- below still knows how to guess.
+        self.stats.oracle_errors = (self.stats.oracle_errors or 0) + 1
+        logger.warn("PencilHW: pen oracle failed, falling back to the gate:", pose)
+        self:closePenOracle()
+        self.pen_oracle_dead = true
+        return nil
+    end
+    if pose then self.stats.oracle_frames = pose.frames end
+    return pose
+end
+
+-- Is the listener still worth the descriptor? It can no longer cost ink -- that
+-- is what the earned claims in classifyStylusOrigin are for -- so this is only
+-- about not reading a useless node for the rest of the session, and about
+-- saying so in the diagnostics rather than doing it silently.
+--
+-- A listener that has answered this many samples without ever once naming the
+-- pen is not reading a digitizer.
+function PencilHandwriting:penOracleHealthy()
+    if (self.stats.oracle_pen or 0) > 0 then return true end
+    if (self.stats.oracle_pen_tool or 0) > 0 then return true end
+    if (self.stats.oracle_hovers or 0) > 0 then return true end
+    if (self.stats.oracle_judged or 0) < Config.PEN_ORACLE_MAX_SILENT then return true end
+
+    self.pen_oracle_dead = true
+    self.stats.last_oracle = string.format("gave up after %d samples: never saw the pen",
+        self.stats.oracle_judged or 0)
+    logger.warn("PencilHW: pen oracle has never recognised the pen;",
+        "every sample keeps going to the distance gate")
+    self:closePenOracle()
+    return false
+end
+
+-- Who sent this sample: "pen", "skin", or nil when the oracle cannot say and
+-- the distance gate has to decide. x/y are in the plugin's own coordinate space
+-- (toNativeCoords' output) -- the same space the oracle reports its position in.
+--
+-- This is the one function in the plugin that can silently cost a session's
+-- writing: every "skin" here is a sample that will not become ink, and "no ink"
+-- looks exactly like "no pen" from the outside. So it only says it on evidence
+-- it has earned, and each of the three claims is earned separately (see the
+-- trust notes in Config.PEN_ORACLE):
+--
+--   * the tool bits, once the node has reported a pen tool at all,
+--   * BTN_TOUCH,     once the node has reported the tip down at all,
+--   * the distance,  once the node has agreed with the pen about a position.
+--
+-- Anything short of that answers nil -- not "hand", not "pen", just "ask the
+-- gate", which is what the plugin did before any of this existed.
+function PencilHandwriting:classifyStylusOrigin(x, y, in_contact)
+    if not Config.PEN_ORACLE or self.pen_oracle_off then return nil end
+    if not self:penOracleHealthy() then return nil end
+
+    local pose = self:penOraclePose()
+    if not pose then return nil end
+
+    self.stats.oracle_judged = (self.stats.oracle_judged or 0) + 1
+
+    local pen_tool, eraser_tool, highlighter_tool = toolTypes()
+    local tool_is_pen = pose.tool == pen_tool
+        or pose.tool == eraser_tool
+        or pose.tool == highlighter_tool
+    if not tool_is_pen then
+        -- The tool bits belong to this node alone and nothing switches them back
+        -- except the pen leaving. But "no pen tool" is only evidence from a node
+        -- that has ever reported one: a listener on the wrong node never will,
+        -- and believing it there would refuse every sample of the session.
+        if (self.stats.oracle_pen_tool or 0) == 0 then return nil end
+        return self:noteOracleSkin(pose, x, y, "no pen tool")
+    end
+
+    self.stats.oracle_pen_tool = (self.stats.oracle_pen_tool or 0) + 1
+
+    if not in_contact then
+        -- Hover and lift. Only the pen produces them, and they never draw.
+        self.stats.oracle_hovers = (self.stats.oracle_hovers or 0) + 1
+        return "pen"
+    end
+
+    self.stats.oracle_contacts = (self.stats.oracle_contacts or 0) + 1
+
+    if not pose.contact then
+        -- The digitizer says the tip is up, so whatever is pressing on the glass
+        -- is not the pen. This one needs no agreement -- it is not a position
+        -- comparison -- but it does need a node that reports contact at all.
+        if (self.stats.oracle_down or 0) == 0 then return nil end
+        return self:noteOracleSkin(pose, x, y, "tip up")
+    end
+
+    self.stats.oracle_down = (self.stats.oracle_down or 0) + 1
+
+    local dx, dy = x - pose.x, y - pose.y
+    local dist2 = dx * dx + dy * dy
+    self:noteOracleDistance(dist2)
+
+    local tol = Config.PEN_ORACLE_POS_TOL_PX
+    if dist2 <= tol * tol then
+        -- Agreed: this sample is the pen -- and this is also what earns the
+        -- right to use a distance against a sample at all. Which is why the
+        -- *first* contact of a session is always drawn when the tip is down,
+        -- whatever units the two readers happen to be in.
+        self.stats.oracle_pen = (self.stats.oracle_pen or 0) + 1
+        return "pen"
+    end
+
+    if (self.stats.oracle_pen or 0) == 0 then
+        -- Tip down, but the two sides have never once agreed on a position: a
+        -- distance measured between two spaces that have not been shown to be
+        -- the same space says nothing about who sent this sample. Stay quiet.
+        return nil
+    end
+
+    -- Tip down, and the listener is known to see the pen where it is: this went
+    -- to a hand, while the pen rests elsewhere on the page.
+    return self:noteOracleSkin(pose, x, y, "not at the pen")
+end
+
+-- One place for the refusals, so the diagnostics can name the one that fired:
+-- "skin" on its own does not say whether the tip was up, the tool was missing,
+-- or the contact was simply in the wrong place.
+function PencilHandwriting:noteOracleSkin(pose, x, y, why)
+    self.stats.oracle_skin = (self.stats.oracle_skin or 0) + 1
+    self.stats.last_oracle = string.format("skin/%s slot@%d,%d pose@%d,%d",
+        why, math.floor(x), math.floor(y), math.floor(pose.x), math.floor(pose.y))
+    return "skin"
+end
+
+-- The smallest distance seen between a contact (a pen tool active, tip down)
+-- and the pose, and the last one. `oracle_min_dist` is the number to look at
+-- when the pen "does not write": a device whose two readers share a coordinate
+-- space sits in the low tens of pixels, while one reading another node, or the
+-- same node in other units, never gets anywhere near -- and that failure is
+-- otherwise indistinguishable from a plugin that simply stopped drawing.
+function PencilHandwriting:noteOracleDistance(dist2)
+    local d = math.sqrt(dist2)
+    local best = self.stats.oracle_min_dist
+    if not best or best < 0 or d < best then
+        self.stats.oracle_min_dist = d
+    end
+    self.stats.oracle_last_dist = d
+end
+
+-- May this pen event move the ink? `kind` is "down", "move" or "hover".
+-- A false answer means "this sample is not the pen": it is not used for the
+-- stroke, and it does not move the anchor either, so a hand resting on the page
+-- cannot drag the reference to itself.
+function PencilHandwriting:penPointAllowed(x, y, kind)
+    if not Config.PEN_ONLY_GATE then return true end
+
+    local ax, ay = self.pen_anchor_x, self.pen_anchor_y
+    if not (ax and ay) then
+        self:movePenAnchor(x, y)
+        return true
+    end
+
+    local dx, dy = x - ax, y - ay
+    local dist2 = dx * dx + dy * dy
+    local floor = Config.PEN_MAX_JUMP_PX
+    if dist2 <= floor * floor then
+        self:movePenAnchor(x, y)
+        return true
+    end
+
+    local age = self:penAnchorAgeMs()
+
+    -- A "move" means a stroke is in progress, which means the pen *is* on the
+    -- screen -- so time passing cannot explain a far sample away, and the anchor
+    -- is trusted however long the pen has been standing still. This is the case
+    -- that matters: the writer pauses to think, a hand rests on the page, and the
+    -- stroke must not grow a line pointing at it.
+    --
+    -- "down" and "hover" are different: between strokes the pen really may be
+    -- somewhere else by now (put down, picked up, carried to another part of the
+    -- page), and then the anchor is stale and the contact has to be believed --
+    -- writing must never be blocked by a memory of where the pen used to be.
+    if kind ~= "move" and (age == nil or age > Config.PEN_ANCHOR_MAX_AGE_MS) then
+        self.stats.anchor_resyncs = (self.stats.anchor_resyncs or 0) + 1
+        self:movePenAnchor(x, y)
+        return true
+    end
+
+    -- Starting a stroke is the other case where the anchor may be the end of the
+    -- *previous* stroke -- the pen may have travelled since, and only hover
+    -- reports keep track of that. Where there have never been any, the distance
+    -- proves nothing about the tool, so fail open: writing must not break.
+    if kind == "down" and not self.hover_seen then
+        self:movePenAnchor(x, y)
+        return true
+    end
+
+    -- How much time passed decides what is possible: a pen tip moving quickly
+    -- covers a lot of ground between two samples -- but never more than the cap,
+    -- so a hand cannot become the pen by simply staying there. With no clock to
+    -- ask, the capped limit is used for everything: still far enough to keep a
+    -- hand from reaching across the page.
+    local limit
+    if age then
+        limit = floor + age / 1000 * Config.PEN_MAX_SPEED_PX_S
+        if limit > Config.PEN_MAX_JUMP_CAP_PX then limit = Config.PEN_MAX_JUMP_CAP_PX end
+    else
+        limit = Config.PEN_MAX_JUMP_CAP_PX
+    end
+
+    if dist2 <= limit * limit then
+        self:movePenAnchor(x, y)
+        return true
+    end
+
+    self.stats.pen_points_rejected = (self.stats.pen_points_rejected or 0) + 1
+    self.stats.last_pen_reject = string.format("%s: %d px away (%s ms, limit %d)",
+        kind, math.floor(math.sqrt(dist2) + 0.5),
+        age and tostring(math.floor(age)) or "no clock", math.floor(limit))
+    return false
+end
+
 -- x and y are in native (portrait panel) coordinates. Strokes are stored in
 -- that space and mapped to the current screen only when drawn, so a rotation
 -- does not invalidate them.
 function PencilHandwriting:onPenDown(x, y, pressure)
     if self:isOverlayActive() then return end
+
+    -- The pen is on the glass from here on: the hand resting next to it must not
+    -- be able to drive a gesture, whatever that gesture is called.
+    self:notePenEvent()
+    self:engageTouchBlock("pen down")
 
     self:cancelSettle()
     -- Ink is about to appear on this page, and ink in the framebuffer is what
@@ -1215,6 +1931,9 @@ function PencilHandwriting:onPenMove(x, y, pressure)
     if not self.current_stroke or self.current_stroke.tool ~= "pen" then return end
     if self:isOverlayActive() then return end
 
+    self:notePenEvent()
+    self:engageTouchBlock("pen move")
+
     local dx = x - self.last_pen_x
     local dy = y - self.last_pen_y
     local min_dist = Config.MIN_MOVE_DISTANCE_PX
@@ -1260,6 +1979,11 @@ function PencilHandwriting:onPenMove(x, y, pressure)
 end
 
 function PencilHandwriting:onPenUp()
+    -- Released first and unconditionally: whatever else happens below, touch has
+    -- to come back. Kept short by a tail so the hand following the pen does not
+    -- get a page turn in just after the stroke ended.
+    self:releaseTouchBlock("pen up")
+
     if not self.current_stroke or self.current_stroke.tool ~= "pen" then return end
 
     -- Filed under the page whose content the pen was actually over, which the
@@ -1301,6 +2025,10 @@ end
 function PencilHandwriting:onEraserDown(x, y)
     if self:isOverlayActive() then return end
 
+    -- The eraser is a pen: the hand next to it is just as much in the way.
+    self:notePenEvent()
+    self:engageTouchBlock("eraser down")
+
     self:cancelSettle()
     self:cancelEraseRefresh()
     -- Force the first sample to be scanned, and let the first removal repaint
@@ -1314,10 +2042,14 @@ end
 function PencilHandwriting:onEraserMove(x, y)
     if not self.current_stroke or self.current_stroke.tool ~= "eraser" then return end
     if self:isOverlayActive() then return end
+    self:notePenEvent()
+    self:engageTouchBlock("eraser move")
     self:eraseAt(x, y)
 end
 
 function PencilHandwriting:onEraserUp()
+    self:releaseTouchBlock("eraser up")
+
     self.current_stroke = nil
     self.erase_last_x, self.erase_last_y, self.erase_last_time = nil, nil, nil
     -- Whatever was coalesced while dragging must land on screen now.
@@ -1575,6 +2307,60 @@ function PencilHandwriting:getSidecarDir()
         return ds.doc_sidecar_dir
     end
     return nil
+end
+
+-- Fingerprint of the document, for the export tools (Config.DOC_FINGERPRINT).
+--
+-- An export tool has no way to know which document a stroke file belongs to: a
+-- file full of page numbers is equally plausible for any PDF, and strokes that
+-- land on the wrong pages still look perfectly normal, just wrong. Name, page
+-- count and byte size settle it, and the byte size is the decisive one.
+--
+-- Everything here is best-effort: a document without a path, or a build without
+-- getPageCount, must not stop the plugin from saving strokes.
+function PencilHandwriting:buildDocumentMeta()
+    local doc = self.ui and self.ui.document
+    if not doc then return nil end
+
+    local meta = {}
+    local path = doc.file
+    if type(path) == "string" and path ~= "" then
+        meta.name = path:match("([^/\\]+)$") or path
+        local ext = meta.name:match("%.([%w]+)$")
+        if ext then meta.kind = ext:lower() end
+
+        -- Size without reading a byte: io.open + seek("end"). lfs and the
+        -- document's own API both exist on some builds and not others.
+        local f = io.open(path, "rb")
+        if f then
+            local size = f:seek("end")
+            f:close()
+            if tonumber(size) and size > 0 then meta.bytes = size end
+        end
+    end
+
+    if type(doc.getDocumentKind) == "function" then
+        local ok, kind = pcall(doc.getDocumentKind, doc)
+        if ok and type(kind) == "string" and kind ~= "" then
+            meta.kind = kind:lower()
+        end
+    end
+    if type(doc.getPageCount) == "function" then
+        local ok, count = pcall(doc.getPageCount, doc)
+        if ok and tonumber(count) and tonumber(count) > 0 then
+            meta.pages = math.floor(tonumber(count))
+        end
+    end
+
+    if next(meta) == nil then return nil end
+    return meta
+end
+
+function PencilHandwriting:refreshDocumentMeta()
+    if type(self.store) ~= "table" then return end
+    local ok, meta = pcall(self.buildDocumentMeta, self)
+    if not ok then return end
+    self.store:setDocumentMeta(meta)
 end
 
 -- ---------------------------------------------------------------------------
@@ -1871,6 +2657,290 @@ function PencilHandwriting:isOverlayActive()
 end
 
 -- ============================================================================
+-- Touch blocking
+-- ============================================================================
+-- This has to be told apart from what protects the ink. The ink is protected by
+-- knowing which samples came from the pen (see the origin oracle above); what a
+-- hand is allowed to do to the interface is a separate question, answered here.
+--
+-- A touch zone can match only one gesture name -- GestureRange compares `ges`
+-- with ==, so a list never matches -- which means one zone per gesture, and a
+-- wrist being dragged across the screen (swipe / pan / pinch / multiswipe) had
+-- no zone at all. It turned the page in the middle of a stroke. What covers all
+-- of them at once is the reader-wide ignore-touch state, which swaps out the
+-- input container's gesture handler, so no gesture type gets through whatever it
+-- is called.
+--
+-- Finger input has to survive that, so it is spent on the narrowest window that
+-- still makes sense (see touchBlockLevel below). Two safety nets come with it,
+-- both KOReader's own: showing a widget restores touch for as long as it is on
+-- screen, and the state is reset on resume. The watchdog below covers the third
+-- case, a pen whose release never arrives.
+--
+-- How much touch to take away, if any. There are two levels, and the second one
+-- exists only because a finger has to keep working:
+--
+--   "strict"  -- the menu switch is on: the whole writing session is covered, so
+--                the pen merely being around is enough;
+--   "contact" -- the default: only while the tip is on the glass, which is the
+--                one moment a touch cannot be anything but a hand.
+--
+-- nil means nothing is being protected: drawing is off, or a dialog is on screen
+-- and has to stay usable. The tail is handed back with the level, because the two
+-- levels need different ones.
+function PencilHandwriting:touchBlockLevel()
+    if not (self.enabled == true and self:isOverlayActive() == false) then return nil end
+    if Config.PEN_TOUCH_BLOCK and self.block_touch == true then
+        return "strict", Config.PEN_TOUCH_BLOCK_TAIL_MS
+    end
+    if Config.PEN_CONTACT_TOUCH_BLOCK then
+        return "contact", Config.PEN_CONTACT_BLOCK_TAIL_MS
+    end
+    return nil
+end
+
+-- Is the window open *right now*? This is what the zones ask at gesture time.
+--
+-- `near` widens it from "the tip is on the glass" to "the pen was here a moment
+-- ago", and only the tap-shaped zones ask for that (see registerTouchZones): a
+-- palm that stays where it landed after a stroke is a hold or a double tap, and
+-- either opens something in the middle of the page -- while a *finger* turns the
+-- page with a swipe, which no tap-shaped zone matches. So the wider window costs
+-- nothing the user asked for, and closes the one hole the contact window leaves.
+--
+-- With the tip up and the pen nowhere near, both answers are no and the zones
+-- hand the gesture back untouched.
+function PencilHandwriting:touchBlockWanted(near)
+    if self:touchBlockLevel() == nil then return false end
+    if self.pen_contact == true then return true end
+    if near then return self:penNearBy() end
+    return false
+end
+
+-- Shared handler of the blocking zones: consume the gesture while the contact
+-- window is open, otherwise hand it straight back. Returning false lets the
+-- normal zone (page turn, menu, footer) deal with it, which is what keeps finger
+-- input working the rest of the time.
+function PencilHandwriting:consumeTouchBlocked()
+    return self:touchBlockWanted(false)
+end
+
+-- The same, for the hold and double-tap zones, which stay covered for a moment
+-- after the pen has gone: those are the gestures a hand makes by accident while
+-- the pen is around, and neither of them is how anybody deliberately turns a
+-- page.
+function PencilHandwriting:consumeTouchBlockedNear()
+    return self:touchBlockWanted(true)
+end
+
+-- The tip (or the eraser) is off the glass again.
+function PencilHandwriting:notePenLift()
+    if self.pen_contact ~= true then return end
+    self:releaseTouchBlock("pen up")
+end
+
+function PencilHandwriting:setTouchBlocked(on, reason)
+    local ui = self.ui
+    if not (ui and ui.setIgnoreTouchInput) then return end
+    if self.touch_blocked == on then return end
+
+    -- Colon call: setIgnoreTouchInput lives on InputContainer, and calling it
+    -- with a dot would pass nil as self. It returns whether the state actually
+    -- changed, which is how a *pre-existing* block is told from our own.
+    local ok, changed = pcall(ui.setIgnoreTouchInput, ui, on)
+    if not ok then
+        self.stats.touch_block_errors = (self.stats.touch_block_errors or 0) + 1
+        logger.err("PencilHW: setIgnoreTouchInput failed:", changed)
+        return
+    end
+
+    self.touch_blocked = on
+    if on and changed == false then
+        -- Touch was already off -- the Dispatcher's "toggle touch input" action
+        -- switches the same state -- so it did not change because of us.
+        self.touch_block_foreign = true
+    end
+    if on then
+        self.stats.touch_block_enters = (self.stats.touch_block_enters or 0) + 1
+    else
+        self.stats.touch_block_releases = (self.stats.touch_block_releases or 0) + 1
+    end
+    logger.dbg("PencilHW: touch block", on and "on" or "off", reason or "")
+end
+
+-- The pen is on the glass: hold touch off for as long as that lasts. Called on
+-- pen down and again on every pen move (where the "already held" check makes it
+-- two comparisons), so a block the watchdog had to drop is picked up again as
+-- soon as the pen reports anything.
+--
+-- `hover` is the strict level reporting a pen that is around but not touching.
+-- It never marks a contact, and at the contact level it does nothing at all:
+-- covering the whole session is the entire reason that switch exists.
+function PencilHandwriting:engageTouchBlock(reason, hover)
+    if not hover then self.pen_contact = true end
+
+    local level = self:touchBlockLevel()
+    if not level or (hover and level ~= "strict") then
+        -- Nothing is wanted right now -- drawing is off, a dialog is up, or this
+        -- is only a hover at the contact level. Make sure nothing of ours is
+        -- still being held. A hover release would be meaningless: the window is
+        -- not ours to close in that case.
+        if not hover then
+            self:releaseTouchBlock(reason or "not wanted", true)
+        end
+        return
+    end
+
+    -- A window is starting, so any release left over from the last one is void.
+    if self.touch_release_pending then self.touch_release_pending = false end
+
+    -- Already held, and the watchdog that guards it is armed: re-arming both on
+    -- every move event would only flood the timer queue.
+    if self.touch_blocked then return end
+
+    self.touch_block_generation = self.touch_block_generation + 1
+    self:setTouchBlocked(true, reason or "pen")
+    self:armTouchWatchdog(self.touch_block_generation)
+end
+
+-- The pen is off the glass: keep the block for a short tail, then hand touch
+-- back. The tail matters because the hand usually leaves after the pen does and
+-- a swipe is only recognised when the finger lifts.
+--
+-- Note what is *not* done here: the generation is left alone, so the watchdog
+-- stays armed and a stroke that starts inside the tail keeps its protection.
+-- `immediately` is for the cases with no stroke to protect -- closing the
+-- document, switching drawing or blocking off, suspending -- and does invalidate
+-- the pending timers.
+function PencilHandwriting:releaseTouchBlock(reason, immediately)
+    self.pen_contact = false
+
+    if not self.touch_blocked then return end
+
+    if self.touch_block_foreign then
+        -- Touch was already off when the pen went down: dropping the block now
+        -- would mean switching somebody else's setting back on.
+        self.touch_block_foreign = false
+        self.touch_blocked = false
+        self.touch_release_pending = false
+        self.touch_block_generation = self.touch_block_generation + 1
+        logger.dbg("PencilHW: touch was already off before the stroke; leaving it off")
+        return
+    end
+
+    if immediately then
+        self.touch_block_generation = self.touch_block_generation + 1
+        self.touch_release_pending = false
+        self:setTouchBlocked(false, reason or "release")
+        return
+    end
+
+    -- Hover reports keep arriving while the pen leaves; the deadline must not be
+    -- pushed back by them.
+    if self.touch_release_pending then return end
+    self.touch_release_pending = true
+
+    local generation = self.touch_block_generation
+    local why = reason or "pen up"
+    -- The tail depends on the level: the contact window only has to outlive the
+    -- hand following the pen off the glass, while the strict level's tail is what
+    -- keeps a session covered between two strokes.
+    local _, tail = self:touchBlockLevel()
+    if not tail then tail = Config.PEN_CONTACT_BLOCK_TAIL_MS end
+    UIManager:scheduleIn(tail / 1000, function()
+        -- A timer callback is run by KOReader's own loop, not by a pcall'd
+        -- handler, so it has to protect itself.
+        local ok, err = pcall(function()
+            self.touch_release_pending = false
+            if self.touch_block_generation ~= generation then return end
+            -- A new stroke started inside the tail: that stroke owns the block now.
+            if self.pen_contact then return end
+            self:setTouchBlocked(false, why)
+        end)
+        if not ok then
+            logger.err("PencilHW: releasing the touch block failed:", err)
+        end
+    end)
+end
+
+-- UIManager:scheduleIn is one-shot, so the watchdog re-arms itself. It exists
+-- for the pen that stops reporting without ever sending an up event, which would
+-- otherwise leave touch switched off until KOReader is restarted. As long as the
+-- pen keeps sending events the block is the intended state and the watch
+-- restarts; only a pen that has gone completely quiet for the whole window is
+-- treated as gone.
+function PencilHandwriting:armTouchWatchdog(generation)
+    local seen = self.pen_event_seq or 0
+    UIManager:scheduleIn(Config.PEN_TOUCH_BLOCK_QUIET_MS / 1000, function()
+        local ok, err = pcall(function()
+            if self.touch_block_generation ~= generation then return end
+            -- Nothing is held any more (the tail timer got there first), so the
+            -- watch has nothing left to guard and simply stops.
+            if not self.touch_blocked then return end
+            if (self.pen_event_seq or 0) ~= seen then
+                self:armTouchWatchdog(generation)
+                return
+            end
+
+            self.stats.touch_block_watchdog = (self.stats.touch_block_watchdog or 0) + 1
+            logger.warn("PencilHW: no pen events for", Config.PEN_TOUCH_BLOCK_QUIET_MS,
+                "ms; releasing the touch block")
+            -- Through releaseTouchBlock, so a block that was never ours is left
+            -- alone here too.
+            self:releaseTouchBlock("watchdog", true)
+        end)
+        if not ok then
+            logger.err("PencilHW: touch block watchdog failed:", err)
+        end
+    end)
+end
+
+-- One count per pen event. The watchdog compares it to tell "the pen is still
+-- writing" from "the pen is gone".
+function PencilHandwriting:notePenEvent()
+    self.pen_event_seq = (self.pen_event_seq or 0) + 1
+    self:notePenSeen()
+end
+
+-- "The pen is around": when it was last seen at all, hover included. Separate
+-- from pen_event_seq, which only counts *writing* -- the two answer different
+-- questions, and the zone windows need the wider one.
+function PencilHandwriting:notePenSeen()
+    if not Time then
+        -- No clock: keep the window open rather than shut. A blocked tap costs
+        -- nothing; a dialog opening in the middle of a stroke does.
+        self.pen_seen_time = true
+        return
+    end
+    local ok, t = pcall(Time.now)
+    self.pen_seen_time = (ok and t) or true
+end
+
+function PencilHandwriting:penNearBy()
+    local seen = self.pen_seen_time
+    if seen == nil then return false end
+    if seen == true then return true end
+    if not Time then return true end
+
+    local ok, ms = pcall(function() return Time.to_ms(Time.since(seen)) end)
+    if not (ok and type(ms) == "number") then return true end
+    return ms <= Config.PEN_NEAR_WINDOW_MS
+end
+
+-- Canary for the diagnostics: a gesture that reached the reader *while the pen
+-- was on the glass*. With the global block applied this must stay empty; a
+-- count here means the block is not taking effect on this device and the palm is
+-- getting through after all.
+function PencilHandwriting:noteLeakedGesture(name)
+    if not self.pen_contact then return end
+    if not (self.enabled and self.block_touch) then return end
+
+    local stats = self.stats
+    if not (stats and type(stats.leaked_gestures) == "table") then return end
+    stats.leaked_gestures[name] = (stats.leaked_gestures[name] or 0) + 1
+end
+
+-- ============================================================================
 -- Settings
 -- ============================================================================
 function PencilHandwriting:saveSettings()
@@ -1884,6 +2954,52 @@ end
 -- ============================================================================
 -- Touch zones
 -- ============================================================================
+-- A zone only gets a gesture before the widget that would normally handle it
+-- when it lists that widget's zone id in `overrides`: InputContainer puts the
+-- overriding zone before it in the dependency graph. Ids that do not exist in a
+-- given build are created as dependency nodes and never matched, so naming a
+-- zone that is not there costs nothing.
+--
+-- The reader's own zones, from frontend/apps/reader/modules:
+--   readerhighlight_hold / _hold_pan / _hold_release   long press: dictionary,
+--                                                      highlight, text select
+--   readerfooter_hold                                  long press on the footer
+--   readerhighlight_tap / readerfooter_tap / tap_forward / tap_backward
+--   paging_swipe / rolling_swipe / swipe_link / paging_pan / rolling_pan
+--   tap_link / readerscrolling: inertial_scrolling_tap|_touch
+-- And, from the Gestures plugin, ids equal to the gesture's own name.
+local HOLD_ZONE_OVERRIDES = {
+    "readerhighlight_hold",
+    "readerhighlight_hold_pan",
+    "readerhighlight_hold_release",
+    "readerfooter_hold",
+}
+local DOUBLE_TAP_ZONE_OVERRIDES = {
+    "double_tap_left_side", "double_tap_right_side",
+    "double_tap_top_left_corner", "double_tap_top_right_corner",
+    "double_tap_bottom_left_corner", "double_tap_bottom_right_corner",
+}
+-- Everything a stray hand could reach, for the counting zones below. They only
+-- read and return false, so being listed first cannot change what happens.
+local CANARY_ZONE_IDS = {
+    "readerhighlight_tap", "readerhighlight_tap_select_mode",
+    "readerhighlight_hold", "readerhighlight_hold_pan",
+    "readerhighlight_hold_release", "readerfooter_tap", "readerfooter_hold",
+    "readermenu_tap", "readermenu_ext_tap",
+    "readerconfigmenu_tap", "readerconfigmenu_ext_tap",
+    "tap_forward", "tap_backward", "tap_link", "swipe_link",
+    "paging_swipe", "paging_pan", "paging_pan_release",
+    "rolling_swipe", "rolling_pan", "rolling_pan_release",
+    "inertial_scrolling_tap", "inertial_scrolling_touch",
+    "double_tap_left_side", "double_tap_right_side",
+    "two_finger_swipe_east", "two_finger_swipe_west",
+    "pinch_gesture", "spread_gesture", "rotate_cw", "rotate_ccw",
+}
+local CANARY_GESTURES = {
+    "tap", "double_tap", "two_finger_tap", "hold", "swipe",
+    "pan", "multiswipe", "two_finger_swipe", "pinch", "spread",
+}
+
 -- Taps inside the top strip must keep reaching the reader menu, otherwise
 -- enabling touch blocking would make the plugin impossible to switch off
 -- again. The real strip height is taken from the reader's own tap zone when
@@ -1906,17 +3022,18 @@ function PencilHandwriting:registerTouchZones()
     self.touch_zones_registered = true
 
     local top = menuStripRatio()
+    -- The top strip is excluded geometrically, so it is not even considered by
+    -- the blocking zones while the menu has to stay reachable.
+    local blocked_area = {
+        ratio_x = 0, ratio_y = top,
+        ratio_w = 1, ratio_h = 1 - top,
+    }
 
-    self.ui:registerTouchZones({
+    local zones = {
         {
             id = "pencil_hw_touch_block",
             ges = "tap",
-            -- The top strip is excluded geometrically, so it is not even
-            -- considered by this zone while the menu has to stay reachable.
-            screen_zone = {
-                ratio_x = 0, ratio_y = top,
-                ratio_w = 1, ratio_h = 1 - top,
-            },
+            screen_zone = blocked_area,
             overrides = {
                 "readerfooter_tap", "readerconfigmenu_tap",
                 "tap_forward", "tap_backward",
@@ -1925,12 +3042,67 @@ function PencilHandwriting:registerTouchZones()
             handler = function()
                 -- Returning false hands the gesture back to the normal
                 -- handlers, which is what we want whenever blocking is off.
-                if not (self.enabled and self.block_touch) then return false end
-                if self:isOverlayActive() then return false end
-                return true
+                return self:consumeTouchBlocked()
             end,
         },
-    })
+    }
+
+    -- A hand resting on the screen does not only tap: it sits still long enough
+    -- to be a hold, and it knocks out the odd double tap. Both of those happen
+    -- *before* the pen lands -- there is no pen event yet to gate on -- and a
+    -- palm left where it was after a stroke makes them *after* the pen has gone
+    -- as well, which is why these two zones stay covered for a moment after the
+    -- last pen event instead of following the tip exactly (see penNearBy). They
+    -- need zones of their own either way. (The gestures made *while* the pen is
+    -- down are covered by the global ignore-touch state instead: a zone can only
+    -- match one gesture name, so covering swipe/pan/pinch/multiswipe by zones
+    -- would take a dozen of them.)
+    --
+    -- The `tap` zone above deliberately does *not* widen: a tap is also how a
+    -- page is turned by hand, and taking that away for two seconds after every
+    -- stroke is exactly the kind of interference this whole design is avoiding.
+    if Config.BLOCK_HOLD_GESTURES then
+        zones[#zones + 1] = {
+            id = "pencil_hw_touch_block_hold",
+            ges = "hold",
+            screen_zone = blocked_area,
+            overrides = HOLD_ZONE_OVERRIDES,
+            handler = function() return self:consumeTouchBlockedNear() end,
+        }
+    end
+    if Config.BLOCK_DOUBLE_TAP then
+        zones[#zones + 1] = {
+            id = "pencil_hw_touch_block_double_tap",
+            ges = "double_tap",
+            screen_zone = blocked_area,
+            overrides = DOUBLE_TAP_ZONE_OVERRIDES,
+            handler = function() return self:consumeTouchBlockedNear() end,
+        }
+    end
+
+    -- Canaries. These consume nothing at all -- they return false, so the
+    -- gesture carries on to whoever would normally handle it -- they only count
+    -- what reached the reader while the pen was on the glass. With the global
+    -- block in force the count stays empty; anything in it means the block is
+    -- not being applied on this device and the palm is getting through, which is
+    -- otherwise invisible.
+    for _, gesture in ipairs(CANARY_GESTURES) do
+        -- A fresh local per iteration: a closure that captured the loop
+        -- variable itself would end up naming whichever gesture was last.
+        local name = gesture
+        zones[#zones + 1] = {
+            id = "pencil_hw_canary_" .. name,
+            ges = name,
+            screen_zone = { ratio_x = 0, ratio_y = 0, ratio_w = 1, ratio_h = 1 },
+            overrides = CANARY_ZONE_IDS,
+            handler = function()
+                self:noteLeakedGesture(name)
+                return false
+            end,
+        }
+    end
+
+    self.ui:registerTouchZones(zones)
 end
 
 -- ============================================================================
@@ -1963,9 +3135,14 @@ function PencilHandwriting:addToMainMenu(menu_items)
                 sub_item_table_func = function() return self:inputSourceMenu() end,
             },
             {
-                text = _("Block touch while drawing"),
+                text = _("Block touch for the whole writing session"),
                 checked_func = function() return self.block_touch end,
                 callback = function() self:toggleBlockTouch() end,
+            },
+            {
+                text = _("Tell the pen from a hand (digitizer check)"),
+                checked_func = function() return self:penOracleInUse() end,
+                callback = function() self:togglePenOracle() end,
             },
             {
                 text = _("Exclusive pen capture (evdev only)"),
@@ -1989,6 +3166,16 @@ function PencilHandwriting:addToMainMenu(menu_items)
                 text = _("Clear all strokes in document"),
                 callback = function() self:confirmClearAll() end,
             },
+            { separator = true },
+            {
+                text = _("Export stroke data (JSON)"),
+                callback = function() self:exportStrokeJSON() end,
+            },
+            {
+                text = _("Get a PDF with my notes"),
+                callback = function() self:showExportHelp() end,
+            },
+            { separator = true },
             {
                 text = _("Full refresh on page turn (test)"),
                 checked_func = function() return self.full_refresh end,
@@ -2060,6 +3247,10 @@ function PencilHandwriting:setInputMode(mode)
     self.input_mode = mode
     saveGlobalSetting("pencil_hw_input_source", mode)
 
+    -- The change tears the input path down and rebuilds it; a block held over
+    -- the gap would have no watchdog behind it.
+    self:releaseTouchBlock("input source changed", true)
+
     if self.enabled then
         self:stopCapture()
         self:startCapture()
@@ -2093,6 +3284,9 @@ function PencilHandwriting:toggleEnabled()
     if self.enabled then
         self:startCapture()
     else
+        -- Drawing off means nothing is being written, so nothing needs touch
+        -- switched off either.
+        self:releaseTouchBlock("drawing off", true)
         self:stopCapture()
     end
 
@@ -2113,11 +3307,47 @@ function PencilHandwriting:toggleBlockTouch()
     self.block_touch = not self.block_touch
     saveGlobalSetting("pencil_hw_block_touch", self.block_touch)
 
+    -- Switching it off has to give touch back at once, including a block that is
+    -- being held because the pen is down
+    if not self.block_touch then
+        self:releaseTouchBlock("blocking switched off", true)
+    end
+
     UIManager:show(InfoMessage:new{
         text = self.block_touch
-            and _("Touches are now ignored while drawing, so a resting hand cannot turn pages. The top strip still opens the menu.")
-            or _("Touches work normally again while drawing."),
-        timeout = 3,
+            and _("Touches are ignored for the whole writing session, so a resting hand can never turn a page or open anything. Finger gestures come back when the session ends.")
+            or _("Touches are ignored only while the pen tip is on the glass, which is the one moment a touch cannot be anything but a hand. A finger can turn the page the rest of the time."),
+        timeout = 4,
+    })
+end
+
+-- Whether the digitizer check is being used at all: the config switch and the
+-- session override both have to be on, and it is simply not available on the
+-- raw evdev input path (which owns the node itself).
+function PencilHandwriting:penOracleInUse()
+    if not Config.PEN_ORACLE or self.pen_oracle_off then return false end
+    return self.input_mode ~= "evdev"
+end
+
+-- The escape hatch. A listener that reads the digitizer node is either right or
+-- silent, but "silent" and "off" are worth telling apart on the device -- and
+-- if it ever turns out to interfere, this is one menu entry away instead of a
+-- file edit plus a restart.
+function PencilHandwriting:togglePenOracle()
+    self.pen_oracle_off = not self.pen_oracle_off
+    -- Whatever it concluded last time is not this session's business.
+    self.pen_oracle_dead = false
+    if self.pen_oracle_off then
+        self:closePenOracle()
+    elseif self.enabled then
+        self:openPenOracle()
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = self.pen_oracle_off
+            and _("The digitizer node is no longer read: a hand touching the page while the pen writes is judged by the distance from the pen alone. Handwriting and page turns keep working either way.")
+            or _("The digitizer node is read again: a contact nowhere near the pen tip cannot leave ink. It only decides once it has been shown to see the pen."),
+        timeout = 4,
     })
 end
 
@@ -2138,6 +3368,8 @@ function PencilHandwriting:setExclusive(value)
     self.exclusive = value
     saveGlobalSetting("pencil_hw_exclusive", value)
 
+    self:releaseTouchBlock("exclusive capture changed", true)
+
     if self.enabled then
         self:stopCapture()
         self:startCapture()
@@ -2152,6 +3384,43 @@ end
 -- ============================================================================
 -- Diagnostics
 -- ============================================================================
+-- The leak counters as one line, in a stable order so two readouts can be
+-- compared. "none" is the expected and healthy result.
+local function describeLeaks(counts)
+    if type(counts) ~= "table" then return "none" end
+
+    local parts = {}
+    for name, count in pairs(counts) do
+        parts[#parts + 1] = string.format("%s=%d", tostring(name), tonumber(count) or 0)
+    end
+    if #parts == 0 then return "none" end
+
+    table.sort(parts)
+    return table.concat(parts, " ")
+end
+
+-- Which slots the plugin is currently answering for. A "skin" latch that never
+-- clears is the signature of a contact whose lift was never seen, which is worth
+-- seeing before it holds a slot for the session.
+local function describeLatches(latches)
+    if type(latches) ~= "table" then return "none" end
+
+    local parts = {}
+    for slot_no, verdict in pairs(latches) do
+        parts[#parts + 1] = string.format("%s=%s", tostring(slot_no), tostring(verdict))
+    end
+    if #parts == 0 then return "none" end
+
+    table.sort(parts)
+    return table.concat(parts, " ")
+end
+
+-- A distance for the diagnostics: "-" until one has been measured.
+local function describeDistance(value)
+    if type(value) ~= "number" or value < 0 then return "-" end
+    return tostring(math.floor(value + 0.5))
+end
+
 function PencilHandwriting:collectDiagnostics()
     local lines = {}
 
@@ -2198,9 +3467,9 @@ function PencilHandwriting:collectDiagnostics()
     -- The tool values the input layer reports, and the ones we compare against.
     -- "Last slot" shows the raw value: if the eraser reports a tool this map does
     -- not call the eraser, that is visible here rather than guessed at.
-    local pen_t, eraser_t, hi_t = toolTypes()
-    lines[#lines + 1] = string.format("toolmap: pen=%s eraser=%s highlighter=%s",
-        tostring(pen_t), tostring(eraser_t), tostring(hi_t))
+    local pen_t, eraser_t, hi_t, finger_t = toolTypes()
+    lines[#lines + 1] = string.format("toolmap: pen=%s eraser=%s highlighter=%s finger=%s",
+        tostring(pen_t), tostring(eraser_t), tostring(hi_t), tostring(finger_t))
 
     -- Which coordinate space strokes are stored in, and what the view maps to
     -- right now. This is the line that says whether ink is anchored to the
@@ -2260,6 +3529,72 @@ function PencilHandwriting:collectDiagnostics()
         s.erase_scans or 0, s.erase_removed or 0)
     lines[#lines + 1] = string.format("repaints=%d, render errors=%d",
         s.repaints or 0, s.render_errors or 0)
+    -- Pen-only gate: how much skin it turned away, how many samples it dropped
+    -- as "not the pen", and whether hover reports are arriving at all -- without
+    -- them the start of a stroke cannot be gated on the distance safely.
+    lines[#lines + 1] = string.format(
+        "pen-only gate: %s | skin events=%d, other tools=%d, dropped samples=%d, anchor resyncs=%d",
+        Config.PEN_ONLY_GATE and "on" or "off", s.skin_events or 0, s.other_tool_events or 0,
+        s.pen_points_rejected or 0, s.anchor_resyncs or 0)
+    lines[#lines + 1] = string.format(
+        "pen path: hover/lift events=%d, hover seen=%s, anchor age=%s",
+        s.hover_events or 0, self.hover_seen and "yes" or "no",
+        tostring(self:penAnchorAgeMs()))
+    -- Origin oracle: what the digitizer node itself said. `pen` and `hovers`
+    -- against `contacts` is the health check: a listener that answered "not the
+    -- pen" to many contacts without ever recognising the pen -- not even the
+    -- hover that any approach to the page produces -- has switched itself off,
+    -- leaving the gate above in charge again.
+    local oracle_state = "off"
+    if Config.PEN_ORACLE then
+        if self.pen_oracle_dead then
+            oracle_state = "gave up"
+        elseif self.pen_oracle and self.pen_oracle:isOpen() then
+            oracle_state = (self.pen_oracle:isProven() and "listening" or "warming up")
+                .. " (" .. tostring(self.pen_oracle.device_path) .. ")"
+        else
+            oracle_state = "unavailable"
+        end
+    end
+    lines[#lines + 1] = string.format(
+        "pen oracle: %s | frames=%d, judged=%d, pen=%d, hovers=%d, skin=%d, contacts=%d, no answer=%d, errors=%d",
+        oracle_state, s.oracle_frames or 0, s.oracle_judged or 0, s.oracle_pen or 0,
+        s.oracle_hovers or 0, s.oracle_skin or 0, s.oracle_contacts or 0,
+        s.oracle_unknown or 0, s.oracle_errors or 0)
+    -- What the listener has earned the right to say: each of the three counters
+    -- unlocks one of its refusals, and until one is non-zero the corresponding
+    -- answer is not used at all -- which is what keeps a mis-detected listener
+    -- from costing ink instead of merely doing nothing.
+    --
+    -- `min dist` is the one to read when the pen "does not write": it is the
+    -- closest a contact has come to where the digitizer puts the tip, so a
+    -- working device sits in the low tens of pixels while a listener reading
+    -- another node, or the same node in other units, never gets near it.
+    lines[#lines + 1] = string.format(
+        "pen oracle trust: pen tool seen=%d, tip down seen=%d, agreed=%d | min dist=%s px (last %s)",
+        s.oracle_pen_tool or 0, s.oracle_down or 0, s.oracle_pen or 0,
+        describeDistance(s.oracle_min_dist), describeDistance(s.oracle_last_dist))
+    lines[#lines + 1] = string.format("slot answers: %s | frames handed back to a finger=%d",
+        describeLatches(self.slot_latch), s.passthrough_frames or 0)
+    lines[#lines + 1] = string.format("last origin: %s",
+        tostring(s.last_oracle or "-"))
+    lines[#lines + 1] = T(_("Last dropped sample: %1"), tostring(s.last_pen_reject or "-"))
+    -- Whether the palm protection is actually in place, and whether anything got
+    -- through it. "held=yes" while writing is the whole point of the mechanism.
+    -- The level is printed because it is the thing that decides how much finger
+    -- input survives: "contact" bites only while the tip is down, "strict"
+    -- covers the whole session.
+    local level_name, level_tail = self:touchBlockLevel()
+    lines[#lines + 1] = string.format(
+        "touch block: level=%s held=%s tail=%s quiet=%d, enters=%d releases=%d watchdog=%d errors=%d",
+        level_name or "none", self.touch_blocked and "yes" or "no",
+        level_tail and tostring(level_tail) or "-", Config.PEN_TOUCH_BLOCK_QUIET_MS,
+        s.touch_block_enters or 0, s.touch_block_releases or 0,
+        s.touch_block_watchdog or 0, s.touch_block_errors or 0)
+    -- Empty unless the block is not taking effect on this device: a gesture that
+    -- reached the reader while the pen was down is a leak the user would feel.
+    lines[#lines + 1] = string.format("gestures reaching the reader with the pen down: %s",
+        describeLeaks(s.leaked_gestures))
     lines[#lines + 1] = T(_("Last slot: %1"), s.last_slot or "-")
     lines[#lines + 1] = T(_("Last error: %1"), s.last_error or "-")
 
@@ -2433,6 +3768,54 @@ function PencilHandwriting:confirmClearAll()
             self.store:removeAll()
             self:requestRepaint("ui")
         end,
+    })
+end
+
+-- ============================================================================
+-- Export
+-- ============================================================================
+-- The device cannot turn a PDF and a stroke file into a merged PDF: KOReader
+-- renders PDFs, it does not rewrite them. What it *can* do is hand over the two
+-- files, which is where pencil-ink (see the pencil-export-server directory)
+-- picks them up.
+--
+-- The JSON copy exists because the .lua sidecar is awkward to move around: it
+-- lives inside a `.sdr` directory, and reading it needs a Lua parser. The JSON
+-- is one plain file that any browser upload will accept, and it carries the
+-- document fingerprint so the other end can check it got the right book.
+function PencilHandwriting:exportStrokeJSON()
+    if not self.store then return end
+
+    -- Anything still under the pen belongs in the file too.
+    self:finishStroke(self.page_key)
+    self:refreshDocumentMeta()
+    self.store:save()
+
+    local path, err = self.store:exportJSON()
+    if not path then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Could not write the stroke file:\n%1"), tostring(err)),
+            timeout = 6,
+        })
+        return
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = T(_("Stroke file written:\n%1\n\n%2 strokes on %3 pages.\nUpload it together with the document to a pencil-ink server to get a PDF with your notes."),
+            path, self.store:strokeCount(), self.store:pageCount()),
+        timeout = 8,
+    })
+end
+
+function PencilHandwriting:showExportHelp()
+    local dir = self:getSidecarDir()
+    local sidecar = dir and (dir .. "/" .. Config.SIDECAR_FILENAME) or "-"
+    local json = dir and (dir .. "/" .. Config.JSON_EXPORT_FILENAME) or "-"
+
+    UIManager:show(InfoMessage:new{
+        text = T(_("A PDF with the handwriting is built by a pencil-ink server, not by the reader itself.\n\n1. The strokes live next to the book:\n%1\n\n2. \"Export stroke data (JSON)\" above writes one single file that is easier to upload:\n%2\n\n3. On the server's page, drop the document and that file in, then download the result.\n\nThe server lives in the pencil-export-server directory; starting it is \"python app.py\"."),
+            sidecar, json),
+        timeout = 12,
     })
 end
 
