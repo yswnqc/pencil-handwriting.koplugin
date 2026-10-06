@@ -71,7 +71,7 @@ local O_RDONLY   = 0
 local O_NONBLOCK = 0x800
 
 local EVIOCGRAB  = 0x40044590          -- _IOW('E', 0x90, int)
-local EVIOCGABS  = 0x80184500          -- _IOR('E', 0x40 + abs_code, struct input_absinfo)
+local EVIOCGABS  = 0x80184540          -- _IOR('E', 0x40 + abs_code, struct input_absinfo)
 
 -- ---------------------------------------------------------------------------
 -- /proc/bus/input/devices parsing
@@ -346,7 +346,7 @@ function EvdevReader:open(exclusive)
 
     self:queryAxisRanges(fd)
 
-    if exclusive and C.ioctl(fd, EVIOCGRAB, 1) == 0 then
+    if exclusive and C.ioctl(fd, EVIOCGRAB, ffi.cast("int", 1)) == 0 then
         self.grabbed = true
     elseif exclusive then
         logger.warn("PencilHW: exclusive grab refused on", path)
@@ -362,7 +362,7 @@ end
 function EvdevReader:close()
     if not self.fd then return end
     if self.grabbed and HAS_LIBC then
-        C.ioctl(self.fd, EVIOCGRAB, 0)
+        C.ioctl(self.fd, EVIOCGRAB, ffi.cast("int", 0))
         self.grabbed = false
     end
     if HAS_LIBC then C.close(self.fd) end
