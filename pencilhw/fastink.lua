@@ -95,8 +95,9 @@ local VAR_YRES_VIRTUAL   = 3
 local VAR_YOFFSET        = 5
 local VAR_BPP            = 6
 
-local UPDATE_MODE_PARTIAL = 0
-local TEMP_USE_AMBIENT    = 0x1000
+local UPDATE_MODE_PARTIAL       = 0
+local TEMP_USE_AMBIENT          = 0x1000
+local EPDC_FLAG_FORCE_MONOCHROME = 0x02
 
 local function nowMs()
     local ok, time = pcall(require, "ui/time")
@@ -245,9 +246,13 @@ function FastInk:flush()
     ffi.fill(upd, ffi.sizeof(upd))
     upd[0].top, upd[0].left = y, x
     upd[0].width, upd[0].height = x2 - x, y2 - y
-    upd[0].waveform_mode = Config.FASTINK_WAVEFORM or 1
+    local waveform = self.waveform or Config.FASTINK_WAVEFORM or 1
+    upd[0].waveform_mode = waveform
     upd[0].update_mode = UPDATE_MODE_PARTIAL
-    upd[0].temp = TEMP_USE_AMBIENT
+    upd[0].temp = Config.FASTINK_TEMP or TEMP_USE_AMBIENT
+    if Config.FASTINK_MONO_WAVEFORMS and Config.FASTINK_MONO_WAVEFORMS[waveform] then
+        upd[0].flags = EPDC_FLAG_FORCE_MONOCHROME
+    end
 
     local requests = self.request and { self.request } or MXCFB_SEND_UPDATE
     for _, request in ipairs(requests) do
@@ -269,8 +274,9 @@ end
 
 function FastInk:describe()
     if self.failed then return "failed: " .. self.failed end
-    return string.format("%dx%d %dbpp, updates sent=%d%s", self.w, self.h, self.bpp,
-        self.sent, self.request and string.format(" (0x%08X)", self.request) or "")
+    return string.format("%dx%d %dbpp, waveform=%d, updates sent=%d%s", self.w, self.h,
+        self.bpp, self.waveform or Config.FASTINK_WAVEFORM or 1, self.sent,
+        self.request and string.format(" (0x%08X)", self.request) or "")
 end
 
 function FastInk:close()

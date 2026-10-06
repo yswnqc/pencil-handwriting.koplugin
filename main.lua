@@ -444,6 +444,8 @@ function PencilHandwriting:initReader()
 
     self.exclusive = globalSetting("pencil_hw_exclusive", Config.EXCLUSIVE_GRAB_DEFAULT)
     self.fast_ink_off = not globalSetting("pencil_hw_fast_ink", Config.FASTINK_DEFAULT)
+    self.fast_ink_waveform = tonumber(globalSetting("pencil_hw_fast_ink_waveform",
+        Config.FASTINK_WAVEFORM)) or Config.FASTINK_WAVEFORM
     self.block_touch = globalSetting("pencil_hw_block_touch", Config.BLOCK_TOUCH_DEFAULT)
     self.input_mode = globalSetting("pencil_hw_input_source", Config.INPUT_SOURCE)
     if self.input_mode ~= "auto" and self.input_mode ~= "stylus" and self.input_mode ~= "evdev" then
@@ -935,6 +937,7 @@ function PencilHandwriting:fastInk()
         logger.info("PencilHW: fast ink not used:", self.stats.fast_ink_status)
         return nil
     end
+    fast.waveform = self.fast_ink_waveform
     self.fast_ink = fast
     return fast
 end
@@ -3252,6 +3255,13 @@ function PencilHandwriting:addToMainMenu(menu_items)
                 checked_func = function() return not self.fast_ink_off end,
                 callback = function() self:toggleFastInk() end,
             },
+            {
+                text_func = function()
+                    return T(_("Fast ink waveform: %1"), self:fastInkWaveformName())
+                end,
+                enabled_func = function() return not self.fast_ink_off end,
+                sub_item_table_func = function() return self:fastInkWaveformMenu() end,
+            },
             { separator = true },
             {
                 text = _("Redraw strokes"),
@@ -3461,6 +3471,32 @@ function PencilHandwriting:toggleFastInk()
     -- was just switched off.
     self.fast_ink_dead = false
     self:closeFastInk()
+end
+
+function PencilHandwriting:fastInkWaveformName()
+    for _i, entry in ipairs(Config.FASTINK_WAVEFORMS or {}) do
+        if entry[1] == self.fast_ink_waveform then return _(entry[2]) end
+    end
+    return tostring(self.fast_ink_waveform)
+end
+
+-- Which EPDC waveform the direct path asks for. Applied to an open device at
+-- once, so the difference shows on the very next stroke.
+function PencilHandwriting:fastInkWaveformMenu()
+    local items = {}
+    for _i, entry in ipairs(Config.FASTINK_WAVEFORMS or {}) do
+        local id, label = entry[1], entry[2]
+        table.insert(items, {
+            text = _(label),
+            checked_func = function() return self.fast_ink_waveform == id end,
+            callback = function()
+                self.fast_ink_waveform = id
+                saveGlobalSetting("pencil_hw_fast_ink_waveform", id)
+                if self.fast_ink then self.fast_ink.waveform = id end
+            end,
+        })
+    end
+    return items
 end
 
 function PencilHandwriting:toggleExclusiveCapture()

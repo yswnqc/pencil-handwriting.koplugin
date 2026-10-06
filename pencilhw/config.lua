@@ -421,13 +421,31 @@ Config.POLL_INTERVAL_S           = 0.008
 -- Direct e-ink ink on Android readers with a Freescale EPDC (see fastink.lua).
 -- KOReader's Android refresh copies the whole window per update and has no
 -- waveform control on these devices, which is what made ink lag the pen.
--- FASTINK_WAVEFORM is the EPDC waveform id: 1 is DU (fast, black/white) on the
--- stock BSP waveform tables. FASTINK_INTERVAL_MS coalesces pen samples so the
--- EPDC queue is not flooded.
+--
+-- FASTINK_WAVEFORM is the EPDC waveform id. The ids follow the panel's waveform
+-- file; on the iReader Smart (R1001) the system's own gralloc treats 1 and 6 as
+-- its two binary waveforms (it applies 1-bit dithering to exactly those), which
+-- in the usual E Ink mode order are DU (1) and A2 (6). A2 is the quickest for
+-- black ink. Binary waveforms get EPDC_FLAG_FORCE_MONOCHROME so grey pixels in
+-- the updated rectangle cannot be left half-driven; the settle refresh after
+-- the pen lifts restores them.
+--
+-- FASTINK_TEMP is passed as the update temperature. The iReader gralloc always
+-- sends a fixed 24 (degrees C) rather than TEMP_USE_AMBIENT, whose ambient
+-- value may never be set on Android and can select a slow cold-temperature
+-- waveform.
+--
+-- FASTINK_INTERVAL_MS coalesces pen samples so the EPDC queue is not flooded.
 Config.FASTINK_DEFAULT           = true
 Config.FASTINK_DEVICE            = "/dev/graphics/fb0"
-Config.FASTINK_WAVEFORM          = 1
-Config.FASTINK_INTERVAL_MS       = 20
+Config.FASTINK_WAVEFORM          = 6
+Config.FASTINK_WAVEFORMS         = {
+    { 6, "A2 (fastest, black/white)" },
+    { 1, "DU (fast, black/white)" },
+}
+Config.FASTINK_MONO_WAVEFORMS    = { [1] = true, [6] = true }
+Config.FASTINK_TEMP              = 24
+Config.FASTINK_INTERVAL_MS       = 10
 
 -- ============================================================================
 -- Persistence
