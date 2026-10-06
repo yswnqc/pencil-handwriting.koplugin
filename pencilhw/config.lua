@@ -430,11 +430,17 @@ Config.POLL_INTERVAL_S           = 0.008
 -- the updated rectangle cannot be left half-driven; the settle refresh after
 -- the pen lifts restores them.
 --
--- A2 and DU only know black and white, so a grey pen would be forced to one or
--- the other while writing (a mid or light grey simply vanishes until the settle
--- refresh). Grey pens use FASTINK_GRAY_WAVEFORM instead: DU4, the quick
--- waveform with four grey levels, which is id 7 in the usual E Ink mode order
--- (the iReader pen library itself picks DU4 for grey colours).
+-- A2 only knows black and white, so a grey pen cannot be shown as grey by it
+-- (a mid or light grey would simply vanish until the settle refresh).
+-- FASTINK_MODE (the "Fast ink waveform" menu) picks what a grey pen does while
+-- writing; black ink always uses FASTINK_WAVEFORM, the fastest:
+--   "a2"  -- draw a grey pen black with A2, as fast as a black pen; the settle
+--            refresh after the pen lifts paints the real grey from KOReader's
+--            own buffer.
+--   "du4" -- draw a grey pen grey with FASTINK_GRAY_WAVEFORM: DU4, the quick
+--            waveform with four grey levels, which is id 7 in the usual E Ink
+--            mode order (the iReader pen library itself picks DU4 for grey
+--            colours). A little slower than A2.
 --
 -- FASTINK_TEMP is passed as the update temperature. The iReader gralloc always
 -- sends a fixed 24 (degrees C) rather than TEMP_USE_AMBIENT, whose ambient
@@ -445,12 +451,13 @@ Config.POLL_INTERVAL_S           = 0.008
 Config.FASTINK_DEFAULT           = true
 Config.FASTINK_DEVICE            = "/dev/graphics/fb0"
 Config.FASTINK_WAVEFORM          = 6
-Config.FASTINK_WAVEFORMS         = {
-    { 6, "A2 (fastest, black/white)" },
-    { 1, "DU (fast, black/white)" },
-}
 Config.FASTINK_MONO_WAVEFORMS    = { [1] = true, [6] = true }
 Config.FASTINK_GRAY_WAVEFORM     = 7
+Config.FASTINK_MODE              = "a2"
+Config.FASTINK_MODES             = {
+    { "a2",  "A2 (fastest, black first then grey)" },
+    { "du4", "DU4 (live grey)" },
+}
 Config.FASTINK_TEMP              = 24
 Config.FASTINK_INTERVAL_MS       = 10
 

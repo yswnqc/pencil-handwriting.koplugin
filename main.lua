@@ -444,8 +444,7 @@ function PencilHandwriting:initReader()
 
     self.exclusive = globalSetting("pencil_hw_exclusive", Config.EXCLUSIVE_GRAB_DEFAULT)
     self.fast_ink_off = not globalSetting("pencil_hw_fast_ink", Config.FASTINK_DEFAULT)
-    self.fast_ink_waveform = tonumber(globalSetting("pencil_hw_fast_ink_waveform",
-        Config.FASTINK_WAVEFORM)) or Config.FASTINK_WAVEFORM
+    self.fast_ink_mode = globalSetting("pencil_hw_fast_ink_mode", Config.FASTINK_MODE)
     self.block_touch = globalSetting("pencil_hw_block_touch", Config.BLOCK_TOUCH_DEFAULT)
     self.input_mode = globalSetting("pencil_hw_input_source", Config.INPUT_SOURCE)
     if self.input_mode ~= "auto" and self.input_mode ~= "stylus" and self.input_mode ~= "evdev" then
@@ -937,7 +936,7 @@ function PencilHandwriting:fastInk()
         logger.info("PencilHW: fast ink not used:", self.stats.fast_ink_status)
         return nil
     end
-    fast.waveform = self.fast_ink_waveform
+    fast.waveform = Config.FASTINK_WAVEFORM
     self.fast_ink = fast
     return fast
 end
@@ -950,9 +949,10 @@ end
 function PencilHandwriting:flushLiveInk(sx0, sy0, sx1, sy1)
     local fast = self:fastInk()
     if fast then
-        fast.waveform = self:fastInkWaveformFor(self.color)
+        local color, waveform = self:fastInkStyleFor(self.color)
+        fast.waveform = waveform
         local ok, drawn = pcall(fast.drawLine, fast, sx0, sy0, sx1, sy1,
-            self.width / 2, Canvas.colorFor(self.color))
+            self.width / 2, Canvas.colorFor(color))
         if not ok then
             logger.warn("PencilHW: fast ink failed:", drawn)
             self.stats.fast_ink_status = "error: " .. tostring(drawn)
@@ -976,11 +976,19 @@ function PencilHandwriting:flushLiveInk(sx0, sy0, sx1, sy1)
     self:flushDirtyFast()
 end
 
--- The menu's waveform choice is for black (and white) ink; the binary waveforms
--- cannot show grey, so grey pens get the grey-capable one (see Config).
-function PencilHandwriting:fastInkWaveformFor(color)
-    if color == "black" or color == "white" then return self.fast_ink_waveform end
-    return Config.FASTINK_GRAY_WAVEFORM or self.fast_ink_waveform
+-- What the direct path paints for a pen colour, and with which waveform. Black
+-- (and white) ink always takes the fastest waveform. A2 cannot show grey, so a
+-- grey pen is either painted black and left for the settle refresh to turn grey
+-- (KOReader's own buffer already holds the real colour), or painted grey with
+-- the grey-capable waveform (see Config.FASTINK_MODE).
+function PencilHandwriting:fastInkStyleFor(color)
+    if color == "black" or color == "white" then
+        return color, Config.FASTINK_WAVEFORM
+    end
+    if self.fast_ink_mode == "du4" then
+        return color, Config.FASTINK_GRAY_WAVEFORM or Config.FASTINK_WAVEFORM
+    end
+    return "black", Config.FASTINK_WAVEFORM
 end
 
 function PencilHandwriting:closeFastInk()
@@ -3482,25 +3490,24 @@ function PencilHandwriting:toggleFastInk()
 end
 
 function PencilHandwriting:fastInkWaveformName()
-    for _i, entry in ipairs(Config.FASTINK_WAVEFORMS or {}) do
-        if entry[1] == self.fast_ink_waveform then return _(entry[2]) end
+    for _i, entry in ipairs(Config.FASTINK_MODES or {}) do
+        if entry[1] == self.fast_ink_mode then return _(entry[2]) end
     end
-    return tostring(self.fast_ink_waveform)
+    return tostring(self.fast_ink_mode)
 end
 
--- Which EPDC waveform the direct path asks for. Applied to an open device at
--- once, so the difference shows on the very next stroke.
+-- A2 or DU4: decides how a grey pen looks while the pen is down (black ink is
+-- A2 either way). Takes effect on the next stroke.
 function PencilHandwriting:fastInkWaveformMenu()
     local items = {}
-    for _i, entry in ipairs(Config.FASTINK_WAVEFORMS or {}) do
-        local id, label = entry[1], entry[2]
+    for _i, entry in ipairs(Config.FASTINK_MODES or {}) do
+        local mode, label = entry[1], entry[2]
         table.insert(items, {
             text = _(label),
-            checked_func = function() return self.fast_ink_waveform == id end,
+            checked_func = function() return self.fast_ink_mode == mode end,
             callback = function()
-                self.fast_ink_waveform = id
-                saveGlobalSetting("pencil_hw_fast_ink_waveform", id)
-                if self.fast_ink then self.fast_ink.waveform = id end
+                self.fast_ink_mode = mode
+                saveGlobalSetting("pencil_hw_fast_ink_mode", mode)
             end,
         })
     end
