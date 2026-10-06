@@ -1,3 +1,111 @@
+# Pencil handwriting · iReader Smart 适配版
+
+> 本仓库 fork 自 [sharefoo/pencil-handwriting.koplugin](https://github.com/sharefoo/pencil-handwriting.koplugin)，分支 `ireader-smart`。
+> 在原版 0.13.1 基础上修了两个 evdev bug，并新增「Android 墨水屏快速笔迹」，让**掌阅 iReader Smart 一代**能在 KOReader 里用原装电磁笔流畅手写。
+> 原版说明完整保留在本节之后。
+
+## 目标
+
+在 iReader Smart 一代上，用原装 Wacom 电磁笔在 KOReader 里手写批注：
+
+- 笔迹落在笔尖的位置，不偏、不跑到屏幕外；
+- 跟手，延迟低；
+- 抬笔后笔迹保留，按文档保存。
+
+改动前的现象是：插件不报错，但笔写上去什么都没有，就像没有笔一样。
+
+## 测试环境
+
+| 项目 | 值 |
+|---|---|
+| 设备 | 掌阅 iReader Smart 一代，型号 R1001（i.MX6SL，Android 4.4.2） |
+| 数字笔 | `Wacom I2C Digitizer`，`/dev/input/event2`；X 0–15725，Y 0–20967，压感 0–4095 |
+| 屏幕 | 1408×1872；`/dev/graphics/fb0` = `mxc_epdc_fb`，RGB565，内核 3.0.35 |
+| KOReader | nightly **v2026.07.2-220-g83f443c**（2026-10-04，`koreader-android-arm`） |
+
+## KOReader 版本要求（先看这里）
+
+**需要 nightly，版本号 ≥ v2026.07.2-60（2026-08-11 之后构建的）。** 截至 2026-10，稳定版 v2026.07.1 和 v2026.07.2 都不行。
+
+- **稳定版为什么不行**：KOReader 在 Android 上把系统的触摸事件转成自己的输入事件时，丢掉了"这是笔"的信息（不生成 `ABS_MT_TOOL_TYPE`）。于是笔的每个采样都被当成手指，插件注册的 stylus 回调永远不会被调用。
+- **从哪个版本开始修好**：上游修复是 [koreader-base#2501](https://github.com/koreader/koreader-base/pull/2501)「Android input: handle drawing」（2026-08-07），KOReader 主线从 `74f37d14`（2026-08-11，即 v2026.07.2-60）开始包含它。
+- **下载**：<https://build.koreader.rocks/download/nightly/>。Smart 一代是 32 位 ARM，选 `koreader-android-arm-*.apk`。
+- **从稳定版换成 nightly**：两者签名不同，直接覆盖会报 `INSTALL_PARSE_FAILED_INCONSISTENT_CERTIFICATES`。先备份，再卸载旧版，然后安装。设置和插件都在 `/sdcard/koreader`，卸载 app 一般不会删掉它们：
+  ```bash
+  adb pull /sdcard/koreader ~/Desktop/koreader-backup
+  adb uninstall org.koreader.launcher
+  adb install koreader-android-arm-<版本>.apk
+  ```
+- **理论上的例外（未实测）**：如果用「evdev（直读）+ 独占笔输入」，插件自己读笔的设备节点，不依赖 KOReader 的 stylus API，稳定版也许能用。但只有上面这套 nightly 环境是实测过的。
+
+## 推荐设置
+
+路径：排版 → Pencil handwriting
+
+| 菜单项 | 设置 | 原因 |
+|---|---|---|
+| 输入源 | **evdev（直读）** | 「自动」走 Android 输入通道，笔事件会排队；系统日志里见过单个事件等待 2 秒以上 |
+| 独占笔输入 | **开** | 笔（event2）和触摸屏（event1）是两个独立节点：独占后笔不会触发翻页，手指不受影响 |
+| 快速笔迹（Android 墨水屏，实验） | **开**（默认） | 见下面第 3 项改动 |
+| 启用手写 | 开 | |
+
+## 修改内容
+
+### 1. 修复：读不到数字笔的坐标范围（`pencilhw/evdev.lua`）
+
+- **问题**：查询坐标范围的 `EVIOCGABS` 写成了 `0x80184500`，它的 ioctl 编号是 0x00。正确的值是 `_IOR('E', 0x40 + abs, struct input_absinfo)` = `0x80184540`。结果是在**任何设备上**，坐标范围都读成 `0..0`，evdev 直读到的原始坐标从不换算成屏幕坐标，笔迹全画到了屏幕外。日志里的表现是 `pen point (5324, 14322) maps outside the 1408x1872 frame`。
+- **效果**：能正确读到 `raw_x=0..15725 raw_y=0..20967`，笔迹落在笔尖位置。「区分手写笔与手掌」功能里的位置比对，也终于是在同一个坐标系里比较了。
+
+### 2. 修复：「独占笔输入」永远失败（`pencilhw/evdev.lua`）
+
+- **问题**：`C.ioctl(fd, EVIOCGRAB, 1)` 把 Lua 数字直接传进 C 的变参函数。LuaJIT 会把它按 double 传，内核收到的不是整数 1，于是每次都报 `exclusive grab refused`。
+- **修复**：改为 `ffi.cast("int", 1)`；解除独占时同样改为 `ffi.cast("int", 0)`。
+- **效果**：日志显示 `grab=true`。笔事件不再进入 Android 和 KOReader，不会被当成翻页手势，也不会在输入队列里堆积。
+
+### 3. 新增：Android 墨水屏快速笔迹（`pencilhw/fastink.lua`，以及 `main.lua`、`pencilhw/config.lua`、`pencilhw/i18n.lua` 里的接入）
+
+- **问题**：KOReader 的 Android 版每次刷新屏幕，哪怕只有几个像素，都会把整个窗口（1408×1872 RGB32，约 10 MB）复制给 Android。而且它没有为掌阅 R1001 提供墨水屏驱动（这台机器不在 android-luajit-launcher 的 EPD 设备列表里），刷屏用的是系统默认波形。插件每收到一个笔的采样点就触发一次这样的刷新，所以笔迹远远落在笔后面。
+- **做法**：
+  - 书写时，把新画的线段直接写进 `/dev/graphics/fb0` 当前正在显示的那一页；
+  - 用 `MXCFB_SEND_UPDATE`（DU 波形、局部更新）只刷新笔迹所在的矩形；
+  - 每 20 ms 合并一次采样再刷新，避免把墨水屏控制器的队列塞满；
+  - 书写期间暂停 KOReader 自己的刷新，抬笔约 0.6 秒后整屏刷新一次，让 Android 的画面同步回来。
+- **安全措施**：只有同时满足以下条件才启用：运行在 Android 上、framebuffer 是 `mxc_epdc_fb`、尺寸和 KOReader 屏幕一致、屏幕没有旋转。驱动拒绝刷新请求时自动关闭，退回原来的刷新方式。
+  - 菜单里有开关：「快速笔迹（Android 墨水屏，实验）」。
+  - 「输入诊断」里有一行 `fast ink: ...`，显示当前状态和已发送的刷新次数。
+- **效果**：实测延迟明显降低，抬笔后笔迹保留。设备驱动接受的请求编号是 `0x4040462E`（64 字节的 `mxcfb_update_data`）。
+- **参数**（`pencilhw/config.lua`）：`FASTINK_WAVEFORM = 1`（DU）、`FASTINK_INTERVAL_MS = 20`、`FASTINK_DEFAULT = true`。
+
+## 已知限制
+
+- 快速笔迹只在竖屏下生效；横屏时自动退回原来较慢的刷新方式。
+- 只在 iReader Smart 一代上实测过。其他采用 i.MX6 墨水屏控制器的 Android 阅读器理论上可用，但没有验证。
+- DU 波形只有黑白两级：笔迹附近的灰色文字在书写时可能短暂变成黑白，抬笔后的那次整屏刷新会恢复。
+- 「自动」/「KOReader stylus API」输入源在 Android 上有输入排队延迟，建议用 evdev。
+
+## 安装
+
+```bash
+git clone https://github.com/yswnqc/pencil-handwriting.koplugin.git
+cd pencil-handwriting.koplugin
+adb shell mkdir -p /sdcard/koreader/plugins/pencil-handwriting.koplugin
+adb push main.lua _meta.lua pencilhw /sdcard/koreader/plugins/pencil-handwriting.koplugin/
+```
+
+然后**完全退出** KOReader（主菜单 → 退出），再重新打开。插件只在启动时加载。
+
+如果是下载 ZIP，解压出来的文件夹叫 `pencil-handwriting.koplugin-ireader-smart`，要先改名为 `pencil-handwriting.koplugin`（原因见下方原版说明的「安装」一节）。
+
+## 与上游同步
+
+```bash
+git fetch upstream && git rebase upstream/main && git push --force-with-lease
+```
+
+---
+
+> 以下为原版说明（sharefoo/pencil-handwriting.koplugin 0.13.1），未改动。
+
 # Pencil handwriting
 
 KOReader 手写批注插件：在墨水屏阅读器上直接用数字笔在页面上书写，笔迹随内容保留、可擦除、按文档持久化。
