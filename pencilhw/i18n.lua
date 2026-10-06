@@ -47,6 +47,7 @@ local ZH = {
     ["Exclusive pen capture (evdev only)"] = "独占笔输入（仅 evdev）",
     ["Exclusive pen capture: off"] = "独占笔输入：已关闭",
     ["Exclusive pen capture: on"] = "独占笔输入：已开启",
+    ["Fast ink on e-ink (Android, experimental)"] = "快速笔迹（Android 墨水屏，实验）",
     ["Full refresh on every page turn: OFF."] = "每次翻页均整屏刷新：已关闭。",
     ["Full refresh on every page turn: ON.\nIf the ink stops following you now, the panel was not being cleared; if it still follows you, the page identity is wrong."] = "每次翻页均整屏刷新：已开启。\n如果笔迹不再跟着翻页出现，说明是面板没有刷新干净；如果仍然跟着出现，说明页标识有误。",
     ["Full refresh on page turn (test)"] = "翻页整屏刷新（测试）",

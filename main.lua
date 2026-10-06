@@ -105,6 +105,15 @@ local Canvas      = loadSubmodule("canvas")
 local StrokeStore = loadSubmodule("store")
 local ViewMap     = loadSubmodule("viewmap")
 
+-- Optional: a missing or broken fast-ink module only costs the direct e-ink
+-- path, so it must not take the whole plugin down with it.
+local FastInk = (function()
+    local ok, mod = pcall(require, "pencilhw/fastink")
+    if ok then return mod end
+    logger.warn("PencilHW: fast ink unavailable:", mod)
+    return nil
+end)()
+
 -- Read from Config so there is exactly one place to bump: a stale copy here
 -- once made the diagnostics report a version two releases old.
 local BUILD = (Config and Config.VERSION) or "unknown"
@@ -434,6 +443,7 @@ function PencilHandwriting:initReader()
     end
 
     self.exclusive = globalSetting("pencil_hw_exclusive", Config.EXCLUSIVE_GRAB_DEFAULT)
+    self.fast_ink_off = not globalSetting("pencil_hw_fast_ink", Config.FASTINK_DEFAULT)
     self.block_touch = globalSetting("pencil_hw_block_touch", Config.BLOCK_TOUCH_DEFAULT)
     self.input_mode = globalSetting("pencil_hw_input_source", Config.INPUT_SOURCE)
     if self.input_mode ~= "auto" and self.input_mode ~= "stylus" and self.input_mode ~= "evdev" then
@@ -893,6 +903,84 @@ function PencilHandwriting:flushDirtyFast()
     -- That keeps the freshly stamped ink on screen instead of having KOReader
     -- paint the page back over it.
     UIManager:setDirty(nil, "fast", Geom:new{ x = x, y = y, w = x2 - x, h = y2 - y })
+end
+
+-- The direct e-ink path, when this device has one (see pencilhw/fastink.lua).
+-- Opened on the first stroke rather than at load time, and given up on for the
+-- rest of the document once it says no.
+function PencilHandwriting:fastInk()
+    if not FastInk or self.fast_ink_off or self.fast_ink_dead then return nil end
+
+    -- Direct ink lands in the panel's own frame, so only an unrotated screen of
+    -- the panel's size qualifies; anything else keeps the normal path.
+    local w, h = screenDims()
+    local bb = screenBB()
+    if bb and bb.getRotation and bb:getRotation() ~= 0 then return nil end
+
+    if self.fast_ink then
+        if self.fast_ink.failed or not self.fast_ink:matches(w, h) then return nil end
+        return self.fast_ink
+    end
+
+    local device = getDevice()
+    if not (device and device.isAndroid and device:isAndroid()) then
+        self.fast_ink_dead = true
+        return nil
+    end
+
+    local ok, fast, why = pcall(FastInk.open, w, h)
+    if not ok or not fast then
+        self.fast_ink_dead = true
+        self.stats.fast_ink_status = tostring(ok and why or fast)
+        logger.info("PencilHW: fast ink not used:", self.stats.fast_ink_status)
+        return nil
+    end
+    self.fast_ink = fast
+    return fast
+end
+
+-- Puts a freshly stamped segment on the panel. With the direct e-ink path the
+-- segment goes straight to the EPDC and KOReader's own refresh is held back
+-- until the pen lifts: on Android that refresh copies the whole window, and
+-- doing it per pen sample is what made the ink trail the pen. self.dirty keeps
+-- growing meanwhile, so falling back halfway through still refreshes it all.
+function PencilHandwriting:flushLiveInk(sx0, sy0, sx1, sy1)
+    local fast = self:fastInk()
+    if fast then
+        local ok, drawn = pcall(fast.drawLine, fast, sx0, sy0, sx1, sy1,
+            self.width / 2, Canvas.colorFor(self.color))
+        if not ok then
+            logger.warn("PencilHW: fast ink failed:", drawn)
+            self.stats.fast_ink_status = "error: " .. tostring(drawn)
+            self.fast_ink_dead = true
+            self:closeFastInk()
+        elseif drawn then
+            self.fast_ink_pending = true
+            self.stats.fast_ink_segments = (self.stats.fast_ink_segments or 0) + 1
+            -- Samples are coalesced; whatever is left when the pen pauses goes
+            -- out on this trailing tick.
+            if fast.pending and not self.fast_ink_timer then
+                self.fast_ink_timer = function()
+                    self.fast_ink_timer = nil
+                    if self.fast_ink then pcall(self.fast_ink.flush, self.fast_ink) end
+                end
+                UIManager:scheduleIn((Config.FASTINK_INTERVAL_MS or 20) / 1000, self.fast_ink_timer)
+            end
+            return
+        end
+    end
+    self:flushDirtyFast()
+end
+
+function PencilHandwriting:closeFastInk()
+    if self.fast_ink_timer then
+        UIManager:unschedule(self.fast_ink_timer)
+        self.fast_ink_timer = nil
+    end
+    self.fast_ink_pending = false
+    local fast = self.fast_ink
+    self.fast_ink = nil
+    if fast then pcall(fast.close, fast) end
 end
 
 -- Commits a stroke that is still in flight when the document moves under the
@@ -1467,6 +1555,7 @@ function PencilHandwriting:stopCapture()
     if self.reader then
         self.reader:close()
     end
+    self:closeFastInk()
     -- The oracle's descriptor too: it is only worth listening while there is ink
     -- to protect, and it would otherwise be leaked once per document.
     self:closePenOracle()
@@ -1924,7 +2013,7 @@ function PencilHandwriting:onPenDown(x, y, pressure)
     self.stats.live_stamps = (self.stats.live_stamps or 0) + 1
     self:markDirty(Canvas.stampDisc(bb, sx, sy, self.width / 2,
         Canvas.colorFor(self.color)))
-    self:flushDirtyFast()
+    self:flushLiveInk(sx, sy, sx, sy)
 end
 
 function PencilHandwriting:onPenMove(x, y, pressure)
@@ -1972,7 +2061,7 @@ function PencilHandwriting:onPenMove(x, y, pressure)
     self.stats.live_stamps = (self.stats.live_stamps or 0) + 1
     self:markDirty(Canvas.drawLine(bb, sx0, sy0, sx1, sy1,
         self.width / 2, Canvas.colorFor(self.color)))
-    self:flushDirtyFast()
+    self:flushLiveInk(sx0, sy0, sx1, sy1)
 
     self.last_pen_x, self.last_pen_y = x, y
     self:scheduleGhostRefresh()
@@ -1983,6 +2072,15 @@ function PencilHandwriting:onPenUp()
     -- to come back. Kept short by a tail so the hand following the pen does not
     -- get a page turn in just after the stroke ended.
     self:releaseTouchBlock("pen up")
+
+    -- Whatever the direct e-ink path still holds goes out now. Its rectangles
+    -- were never handed to KOReader's refresh (see flushLiveInk); the settle
+    -- refresh scheduled below repaints the whole screen, which covers them.
+    if self.fast_ink_pending then
+        self.fast_ink_pending = false
+        if self.fast_ink then pcall(self.fast_ink.flush, self.fast_ink) end
+        self.dirty = nil
+    end
 
     if not self.current_stroke or self.current_stroke.tool ~= "pen" then return end
 
@@ -3149,6 +3247,11 @@ function PencilHandwriting:addToMainMenu(menu_items)
                 checked_func = function() return self.exclusive end,
                 callback = function() self:toggleExclusiveCapture() end,
             },
+            {
+                text = _("Fast ink on e-ink (Android, experimental)"),
+                checked_func = function() return not self.fast_ink_off end,
+                callback = function() self:toggleFastInk() end,
+            },
             { separator = true },
             {
                 text = _("Redraw strokes"),
@@ -3351,6 +3454,15 @@ function PencilHandwriting:togglePenOracle()
     })
 end
 
+function PencilHandwriting:toggleFastInk()
+    self.fast_ink_off = not self.fast_ink_off
+    saveGlobalSetting("pencil_hw_fast_ink", not self.fast_ink_off)
+    -- A fresh try for a path that gave up, and no descriptor kept for one that
+    -- was just switched off.
+    self.fast_ink_dead = false
+    self:closeFastInk()
+end
+
 function PencilHandwriting:toggleExclusiveCapture()
     if self.exclusive then
         self:setExclusive(false)
@@ -3513,6 +3625,11 @@ function PencilHandwriting:collectDiagnostics()
         "stylus handler errors=%d, coord rejected=%d, coord clamped=%d, erase unmapped=%d",
         s.slot_errors or 0, s.coord_rejected or 0, s.coord_clamped or 0,
         s.erase_unmapped or 0)
+    lines[#lines + 1] = string.format("fast ink: %s, segments=%d",
+        self.fast_ink_off and "off"
+            or (self.fast_ink and self.fast_ink:describe())
+            or s.fast_ink_status or "not opened yet",
+        s.fast_ink_segments or 0)
     -- Proof that the panel clean-up actually ran: a page turn away from a page
     -- with ink must be counted here, otherwise the policy is only a promise.
     lines[#lines + 1] = string.format(

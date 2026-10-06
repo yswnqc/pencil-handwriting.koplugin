@@ -418,6 +418,17 @@ Config.REFRESH_GHOST_MS          = 8000
 
 Config.POLL_INTERVAL_S           = 0.008
 
+-- Direct e-ink ink on Android readers with a Freescale EPDC (see fastink.lua).
+-- KOReader's Android refresh copies the whole window per update and has no
+-- waveform control on these devices, which is what made ink lag the pen.
+-- FASTINK_WAVEFORM is the EPDC waveform id: 1 is DU (fast, black/white) on the
+-- stock BSP waveform tables. FASTINK_INTERVAL_MS coalesces pen samples so the
+-- EPDC queue is not flooded.
+Config.FASTINK_DEFAULT           = true
+Config.FASTINK_DEVICE            = "/dev/graphics/fb0"
+Config.FASTINK_WAVEFORM          = 1
+Config.FASTINK_INTERVAL_MS       = 20
+
 -- ============================================================================
 -- Persistence
 -- ============================================================================
