@@ -430,6 +430,12 @@ Config.POLL_INTERVAL_S           = 0.008
 -- the updated rectangle cannot be left half-driven; the settle refresh after
 -- the pen lifts restores them.
 --
+-- A2 and DU only know black and white, so a grey pen would be forced to one or
+-- the other while writing (a mid or light grey simply vanishes until the settle
+-- refresh). Grey pens use FASTINK_GRAY_WAVEFORM instead: DU4, the quick
+-- waveform with four grey levels, which is id 7 in the usual E Ink mode order
+-- (the iReader pen library itself picks DU4 for grey colours).
+--
 -- FASTINK_TEMP is passed as the update temperature. The iReader gralloc always
 -- sends a fixed 24 (degrees C) rather than TEMP_USE_AMBIENT, whose ambient
 -- value may never be set on Android and can select a slow cold-temperature
@@ -444,6 +450,7 @@ Config.FASTINK_WAVEFORMS         = {
     { 1, "DU (fast, black/white)" },
 }
 Config.FASTINK_MONO_WAVEFORMS    = { [1] = true, [6] = true }
+Config.FASTINK_GRAY_WAVEFORM     = 7
 Config.FASTINK_TEMP              = 24
 Config.FASTINK_INTERVAL_MS       = 10
 

@@ -950,6 +950,7 @@ end
 function PencilHandwriting:flushLiveInk(sx0, sy0, sx1, sy1)
     local fast = self:fastInk()
     if fast then
+        fast.waveform = self:fastInkWaveformFor(self.color)
         local ok, drawn = pcall(fast.drawLine, fast, sx0, sy0, sx1, sy1,
             self.width / 2, Canvas.colorFor(self.color))
         if not ok then
@@ -973,6 +974,13 @@ function PencilHandwriting:flushLiveInk(sx0, sy0, sx1, sy1)
         end
     end
     self:flushDirtyFast()
+end
+
+-- The menu's waveform choice is for black (and white) ink; the binary waveforms
+-- cannot show grey, so grey pens get the grey-capable one (see Config).
+function PencilHandwriting:fastInkWaveformFor(color)
+    if color == "black" or color == "white" then return self.fast_ink_waveform end
+    return Config.FASTINK_GRAY_WAVEFORM or self.fast_ink_waveform
 end
 
 function PencilHandwriting:closeFastInk()
